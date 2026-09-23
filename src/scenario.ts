@@ -12,6 +12,25 @@ export type ExpectAssertion =
   | { response: { method?: string; url: string; status: number; bodyIncludes?: string; jsonPath?: string; equals?: unknown } }
   | { check: { name: string; args?: unknown } };
 
+// Where a later phase starts: a path/URL, or a config check that RETURNS one (`{ url }` on its
+// result) — e.g. a check that reads a mailbox and returns the link in the message it found.
+// Absent: the phase continues on the page exactly as the previous phase left it (a multi-step
+// form whose next step is already showing), with a fresh goal, inputs and expectations.
+export type PhaseStart = string | { check: { name: string; args?: unknown } };
+
+// A phase after the main one: same page/context (cookies, login carry over), a new start, goal,
+// step budget and expectations. Runs only when the previous phase reached Jev DONE with every
+// expectation met; a phase's own inputs add to (and can override) the scenario's.
+export type Phase = {
+  name?: string;
+  start?: PhaseStart;
+  goal: string;
+  inputs?: Record<string, string>;
+  inputFields?: Record<string, string>;
+  maxSteps?: number;
+  expect?: ExpectAssertion[];
+};
+
 export type Scenario = {
   name: string;
   kind?: 'smoke' | 'adversarial' | 'acceptance';
@@ -19,11 +38,81 @@ export type Scenario = {
   start: string;
   goal: string;
   inputs?: Record<string, string>;
+  // Binds an input key to the FIELD it belongs in, by label: a case-insensitive substring, or a
+  // /regex/. Jev still decides when to type and which input; the engine then types it into the
+  // offered fill target whose label matches, whatever target Jev named. On a long form Jev's
+  // target and input choices are made independently and drift (the postcode into the country
+  // field); a hint makes that pairing deterministic. Unmatched hints fall back to Jev's target.
+  inputFields?: Record<string, string>;
   maxSteps?: number;
   expect?: ExpectAssertion[];
   mutates?: boolean;
   intent?: string;
+  then?: Phase[];
+  // Keys of `inputs` (or a phase's inputs) whose VALUE must not reach results.json / the report:
+  // the trail, the certified list and the reason show «key» instead. (Every input value is
+  // already kept out of Jev requests; this is about the run's own outputs.)
+  secretInputs?: string[];
 };
+
+// The literal a scenario author writes wherever a per-run unique value belongs (an email, a
+// name, a search term): replaced once per run, everywhere in the scenario except its `name`.
+export const RUN_PLACEHOLDER = '{{run}}';
+
+// Short, url/email-safe, unique per run: base-36 time (ms) + 4 random base-36 chars.
+export function newRunId(): string {
+  const rand = Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, '0');
+  return `${Date.now().toString(36)}${rand}`;
+}
+
+// PURE: a deep copy of the scenario with every occurrence of `{{run}}` in every string —
+// start, goal, inputs, expect, phases (including check args) — replaced by `runId`. The
+// scenario's `name` and every phase's `name` are left alone: results are grouped, tagged and
+// reported by them, and they must stay stable across runs (and never carry a run's secret).
+export function applyRunId<T extends { name: string }>(scenario: T, runId: string): T {
+  // Only plain JSON-shaped data is rebuilt; anything else (a Date, a RegExp, a class instance a
+  // config's smoke() handed a check as args) is passed through untouched.
+  const plain = (v: object) => {
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+  };
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') return v.split(RUN_PLACEHOLDER).join(runId);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object' && plain(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+    return v;
+  };
+  const { name, ...rest } = scenario as T & { then?: { name?: string }[] };
+  const out = { name, ...(walk(rest) as object) } as T & { then?: { name?: string }[] };
+  if (Array.isArray(out.then)) out.then = out.then.map((p, i) => ({ ...p, name: (scenario as { then?: { name?: string }[] }).then?.[i]?.name }));
+  return out;
+}
+
+// Every input value a run can type, across the scenario and all its phases, keyed by input key
+// — a key reused by two phases with different values lists both. The verdict's "every input
+// reached the server" rule, and the redaction of one phase's values while another phase runs,
+// both need the whole set, not just the phase in hand.
+export function scenarioInputs(s: Pick<Scenario, 'inputs' | 'then'>): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  const add = (inputs?: Record<string, string>) => {
+    for (const [k, v] of Object.entries(inputs ?? {})) {
+      (out[k] ??= []);
+      if (!out[k].includes(v)) out[k].push(v);
+    }
+  };
+  add(s.inputs);
+  for (const p of s.then ?? []) add(p.inputs);
+  return out;
+}
+
+// The phases a run executes in order: the scenario's own fields first, then each `then` entry
+// (named "then #n" when unnamed).
+export function scenarioPhases(s: Scenario): (Phase & { name: string })[] {
+  return [
+    { name: 'main', start: s.start, goal: s.goal, inputs: s.inputs, inputFields: s.inputFields, maxSteps: s.maxSteps, expect: s.expect },
+    ...(s.then ?? []).map((p, i) => ({ ...p, name: p.name ?? `then #${i + 1}` })),
+  ];
+}
 
 const EXPECT_KEYS = ['url', 'text', 'absentText', 'element', 'response', 'check'];
 
@@ -56,6 +145,73 @@ function validateExpect(file: string, scenarioName: string, expect: unknown): as
   });
 }
 
+function validateInputs(file: string, scenarioName: string, inputs: unknown, where: string): void {
+  const ok = inputs && typeof inputs === 'object' && !Array.isArray(inputs) && Object.values(inputs as object).every((v) => typeof v === 'string');
+  if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputs must be an object of string values`);
+}
+
+// `inputs` here is the scope's MERGED inputs (the scenario's plus the phase's own): a phase may
+// hint an input it inherits (the sign-up email typed again on the login page) without
+// redeclaring it.
+function validateInputFields(file: string, scenarioName: string, fields: unknown, inputs: unknown, where: string): void {
+  const ok = fields && typeof fields === 'object' && !Array.isArray(fields) && Object.values(fields as object).every((v) => typeof v === 'string' && v.length > 0);
+  if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputFields must be an object of non-empty strings (a label substring or /regex/ per input key)`);
+  const known = new Set(Object.keys((inputs as object) ?? {}));
+  for (const k of Object.keys(fields as object)) {
+    if (!known.has(k)) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputFields names "${k}", which is not one of its inputs`);
+  }
+}
+
+// PURE: the offered fill target a hint selects for an input key, if any — label match by
+// case-insensitive substring, or by regex when written /…/flags. Frame-hosted targets count.
+export function hintedTarget<A extends { kind: string; label: string }>(hint: string | undefined, actions: A[]): A | undefined {
+  if (!hint) return undefined;
+  const m = /^\/(.*)\/([a-z]*)$/.exec(hint);
+  let test: (label: string) => boolean;
+  try {
+    const re = m ? new RegExp(m[1], m[2]) : null;
+    test = re ? (l) => re.test(l) : (l) => l.toLowerCase().includes(hint.toLowerCase());
+  } catch {
+    return undefined; // a broken /regex/ hints nothing
+  }
+  return actions.find((a) => a.kind === 'fill' && test(a.label.split(' → ')[0]));
+}
+
+function validatePhases(file: string, scenarioName: string, then: unknown, config: Config, scenarioInputs: Record<string, string> = {}): asserts then is Phase[] {
+  if (!Array.isArray(then)) throw new Error(`${file}: scenario "${scenarioName}".then must be an array of phases`);
+  then.forEach((p, i) => {
+    const where = `.then[${i}]`;
+    if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error(`${file}: scenario "${scenarioName}"${where} must be an object`);
+    const ph = p as Record<string, unknown>;
+    if (ph.name !== undefined && (typeof ph.name !== 'string' || ph.name.length === 0)) {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.name must be a non-empty string when present`);
+    }
+    const start = ph.start as unknown;
+    const check = start && typeof start === 'object' && !Array.isArray(start) ? (start as { check?: unknown }).check : undefined;
+    if (start === undefined) {
+      // continue in place
+    } else if (typeof start === 'string') {
+      if (start.length === 0) throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }, or absent to continue on the current page`);
+    } else if (check && typeof check === 'object' && typeof (check as { name?: unknown }).name === 'string') {
+      const name = (check as { name: string }).name;
+      if (!config.checks?.[name]) {
+        throw new Error(`${file}: scenario "${scenarioName}"${where}.start.check references unknown check "${name}" (not in config.checks)`);
+      }
+    } else {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }, or absent to continue on the current page`);
+    }
+    if (typeof ph.goal !== 'string' || ph.goal.length === 0) {
+      throw new Error(`${file}: scenario "${scenarioName}"${where} is missing the required string field "goal"`);
+    }
+    if (ph.expect !== undefined) validateExpect(file, `${scenarioName}${where}`, ph.expect);
+    if (ph.inputs !== undefined) validateInputs(file, scenarioName, ph.inputs, where);
+    if (ph.inputFields !== undefined) validateInputFields(file, scenarioName, ph.inputFields, { ...scenarioInputs, ...((ph.inputs as Record<string, string> | undefined) ?? {}) }, where);
+    if (ph.maxSteps !== undefined && typeof ph.maxSteps !== 'number') {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.maxSteps must be a number when present`);
+    }
+  });
+}
+
 function validateScenario(file: string, s: unknown, config: Config): asserts s is Scenario {
   if (!s || typeof s !== 'object') throw new Error(`${file}: each scenario entry must be an object`);
   const sc = s as Record<string, unknown>;
@@ -75,6 +231,18 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
     throw new Error(`${file}: scenario "${sc.name}" is missing the required string field "goal"`);
   }
   if (sc.expect !== undefined) validateExpect(file, sc.name, sc.expect);
+  if (sc.inputs !== undefined) validateInputs(file, sc.name, sc.inputs, '');
+  if (sc.inputFields !== undefined) validateInputFields(file, sc.name, sc.inputFields, sc.inputs, '');
+  if (sc.then !== undefined) validatePhases(file, sc.name, sc.then, config, (sc.inputs as Record<string, string> | undefined) ?? {});
+  if (sc.secretInputs !== undefined) {
+    const known = new Set([
+      ...Object.keys((sc.inputs as object) ?? {}),
+      ...((sc.then as Phase[] | undefined) ?? []).flatMap((p) => Object.keys(p.inputs ?? {})),
+    ]);
+    if (!Array.isArray(sc.secretInputs) || !sc.secretInputs.every((k) => typeof k === 'string' && known.has(k))) {
+      throw new Error(`${file}: scenario "${sc.name}".secretInputs must be an array of input keys (from inputs or a phase's inputs)`);
+    }
+  }
 
   // Round 7 (M5): a PRESENT but non-string kind (e.g. 0, true, {}) used to fall through to
   // inference below, silently swallowing an obviously-wrong scenario file — only an ABSENT
@@ -86,11 +254,13 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
   if (kind !== 'smoke' && kind !== 'adversarial' && kind !== 'acceptance') {
     throw new Error(`${file}: scenario "${sc.name}" has an invalid kind "${kind}" (must be "smoke", "adversarial", or "acceptance")`);
   }
-  if (kind === 'acceptance' && (!Array.isArray(sc.expect) || sc.expect.length === 0)) {
-    throw new Error(`${file}: scenario "${sc.name}" has kind "acceptance" but no expect assertions (acceptance scenarios need at least one expect entry, or they can never do more than reach Jev DONE unverified)`);
+  const phaseExpects = ((sc.then as Phase[] | undefined) ?? []).some((p) => Array.isArray(p.expect) && p.expect.length > 0);
+  if (kind === 'acceptance' && (!Array.isArray(sc.expect) || sc.expect.length === 0) && !phaseExpects) {
+    throw new Error(`${file}: scenario "${sc.name}" has kind "acceptance" but no expect assertions (acceptance scenarios need at least one expect entry, on the scenario or on a phase, or they can never do more than reach Jev DONE unverified)`);
   }
-  if (kind === 'adversarial' && (!sc.inputs || typeof sc.inputs !== 'object' || Array.isArray(sc.inputs) || Object.keys(sc.inputs as object).length === 0)) {
-    throw new Error(`${file}: scenario "${sc.name}" has kind "adversarial" but has no inputs (adversarial scenarios need at least one hostile input to submit)`);
+  const phaseInputs = ((sc.then as Phase[] | undefined) ?? []).some((p) => p.inputs && Object.keys(p.inputs).length > 0);
+  if (kind === 'adversarial' && (!sc.inputs || typeof sc.inputs !== 'object' || Array.isArray(sc.inputs) || Object.keys(sc.inputs as object).length === 0) && !phaseInputs) {
+    throw new Error(`${file}: scenario "${sc.name}" has kind "adversarial" but has no inputs (adversarial scenarios need at least one hostile input to submit, on the scenario or on a phase)`);
   }
 }
 

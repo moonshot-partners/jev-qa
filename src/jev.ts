@@ -41,6 +41,15 @@ export type Action = {
   expanded?: string;
   delta?: number;
   rect?: { x: number; y: number; w: number; h: number };
+  // Index into the frame table observe() built for this page: 0/undefined = the main document,
+  // n = the n-th child frame it snapshotted (an <iframe>, cross-origin or not). Geometry is
+  // already translated to main-frame (page) coordinates; `node` is an id in THAT frame's cache.
+  frame?: number;
+  // A password field: offered as fillable by name only. Its value is never read into the
+  // observation (always ''), and the text typed into it comes from a scenario input like any
+  // other fill — buildBody() redacts that value out of every request surface (see README
+  // "Secrets"); a scenario's `secretInputs` additionally keeps it out of results/reports.
+  secret?: boolean;
 };
 
 export type Observation = {
@@ -49,9 +58,12 @@ export type Observation = {
   text: string;
   actions: Action[];
   omitted_actions: number;
+  w?: number; // viewport size, as the snapshot saw it (used to clip frame-hosted targets)
+  h?: number;
+  scroll?: { y: number; height: number }; // page scroll position and document height
 };
 
-export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null };
+export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null; failed?: boolean };
 
 // null = no degradation was needed. Otherwise: TypeSafe's edge WAF blocked
 // the normal request and the runner retried with less (see decide()'s ladder).
@@ -119,7 +131,8 @@ function numericEntity(value: string, format: (code: number) => string): string 
 // This exact gap was the real WAF trigger (round 7 addendum): encodeURIComponent(`' OR 1=1`)
 // leaves the quote as a literal `'`, but the real page's own URL carried it as `%27`.
 function formEncode(percentEncoded: string): string {
-  return percentEncoded.replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+  // `~` too: encodeURIComponent leaves it literal, a browser's form submission sends %7E.
+  return percentEncoded.replace(/[!'()*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
 }
 
 // Every string form a hostile input value could survive as by the time it's embedded somewhere
@@ -170,7 +183,7 @@ function prefixPattern(value: string): RegExp | null {
 // truncated prefix — see prefixPattern()) to ONE marker. Shared by redact() (per-input, marker
 // is the input's own «key») and the config-secrets pass (round 8, N2 — marker is always
 // «secret», since a config secret has no scenario-input key to redact it BY).
-function redactValue(text: string, value: string, marker: string): string {
+export function redactValue(text: string, value: string, marker: string): string {
   if (!value) return text;
   let out = text;
   for (const variant of new Set(redactionForms(value))) {
@@ -256,7 +269,7 @@ function stripUrlQuery(url: string): string {
 
 function actionSpace(actions: Action[]) {
   const elements: Record<string, unknown>[] = [];
-  const indices = new Map<number, string>();
+  const indices = new Map<string, string>();
   const targets: Record<string, Record<string, Action>> = {};
   const controls: Record<string, Action> = {};
   const ops: Record<string, string> = { click: 'CLICK', fill: 'TYPE_TEXT', select: 'SELECT' };
@@ -266,12 +279,16 @@ function actionSpace(actions: Action[]) {
       controls[a.id.toUpperCase()] = a;
       continue;
     }
-    let index = indices.get(a.node!);
+    // Node ids are per FRAME (each frame keeps its own snapshot cache, each starting at 1), so
+    // the same id can name two different elements once frames are merged in — key by both.
+    const nodeKey = `${a.frame ?? 0}:${a.node!}`;
+    let index = indices.get(nodeKey);
     if (!index) {
       index = String(elements.length + 1);
-      indices.set(a.node!, index);
+      indices.set(nodeKey, index);
       const el: Record<string, unknown> = { index, label: a.label.split(' → ')[0], role: a.role, operations: [] };
       for (const k of ['value', 'checked', 'selected', 'expanded'] as const) if (a[k] !== undefined) el[k] = a[k];
+      if (a.secret) el.secret = true; // a password field: fill it by name; its value is never shown
       if (a.kind === 'select') Object.assign(el, { value: a.current_value ?? '', options: [] });
       elements.push(el);
     }
@@ -299,6 +316,7 @@ export type BuiltRequest = {
   targets: Record<string, Record<string, Action>>;
   controls: Record<string, Action>;
   elements: Record<string, unknown>[];
+  originals: WeakMap<Action, Action>; // redacted copy → the observation's own entry
 };
 
 // PURE (no network): everything decide() sends to TypeSafe, and everything it
@@ -347,6 +365,15 @@ export function buildBody(
     expanded: a.expanded !== undefined ? redactField(a.expanded, valueClip) : undefined,
   }));
   const { elements, targets, controls } = actionSpace(redactedActions);
+  // Everything buildBody() returns stays REDACTED (the request, and the tables used to read the
+  // answer). The map back to the ORIGINAL observation entries is what decide() hands the runner:
+  // it compares an action's current `value` with the raw text it typed (the overwrite and
+  // already-holds guards), and a redacted «key» token can never equal a raw value — those guards
+  // were dead against a real Jev answer. A WeakMap serialises to {} and carries nothing itself.
+  const originals = new WeakMap<Action, Action>();
+  obs.actions.forEach((a, i) => originals.set(redactedActions[i], a));
+
+  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
 
   // L2: keys already certified as submitted (see the function doc comment) are pruned from
   // every input-choosing surface below — not just filtered out of display, but genuinely never
@@ -396,14 +423,24 @@ export function buildBody(
     // that already contains the requested value") compares these as literal strings, and a
     // bare "query" next to a redacted "«query»" never matches. Numbered relative to what's
     // actually offered (remainingInputs), so "#1" is always the next uncertified input.
+    // Which inputs were ALREADY typed this phase, and where — from the FULL history, not the
+    // ten-entry `recent_actions` window: on a long form Jev's own "use the first one the recent
+    // actions have not typed yet" rule forgot the first fields once ten actions had passed and
+    // retyped them into whatever field it was looking at.
+    const typedInto = new Map<string, string>();
+    for (const h of history) {
+      if (h.kind !== 'fill' || h.text == null || h.failed) continue; // a fill that never executed typed nothing
+      const k = valueToKey.get(h.text);
+      if (k !== undefined && !typedInto.has(k)) typedInto.set(k, h.action);
+    }
     const criteria: Record<string, string> = {};
     remainingInputs.forEach((k, i) => {
-      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)`;
+      const typed = typedInto.get(k);
+      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)${typed ? `; already typed into "${scrubGeneric(redact(typed, inputs, secrets), pseudonyms)}"` : ''}`;
     });
     questions.text_value = { type: 'choice', criteria, instructions: { goal: redactedGoal, rules: TEXT } };
   }
 
-  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
   const recentActions = history.slice(-10).map((h) => ({
     ...h,
     // M1 (round 7): the free-text action label (e.g. "Search flower") was never redacted at
@@ -432,7 +469,7 @@ export function buildBody(
     questions,
   };
 
-  return { body, operations, targets, controls, elements };
+  return { body, operations, targets, controls, elements, originals };
 }
 
 function isEdgeBlockBody(text: string): boolean {
@@ -510,7 +547,8 @@ export async function decide(
   const latencyMs = Math.round(performance.now() - started);
   const inputTokens = result.usage?.input_tokens ?? 0;
 
-  const { operations, targets, controls } = built!;
+  const { operations, targets, controls, originals } = built!;
+  const original = (a: Action) => originals.get(a) ?? a;
   const opAnswer = validate(result.answers.operation, Object.keys(operations));
   const operation = opAnswer.choice;
   let action: Action | null = null;
@@ -519,9 +557,9 @@ export async function decide(
   if (operation in targets) {
     const head = targets[operation];
     const t = validate(result.answers[`${operation.toLowerCase()}_target`], Object.keys(head));
-    action = head[t.choice];
+    action = original(head[t.choice]);
     for (const [k, p] of Object.entries(t.probabilities).sort((a, b) => b[1] - a[1])) {
-      if (k !== t.choice && p >= 0.05) alternatives.push(head[k]);
+      if (k !== t.choice && p >= 0.05) alternatives.push(original(head[k]));
     }
     if (operation === 'TYPE_TEXT') {
       // Jev chose a KEY (it never saw the value); substitute the real value back in locally.
@@ -530,7 +568,7 @@ export async function decide(
       text = inputs[validate(result.answers.text_value, remainingInputs).choice];
     }
   } else if (operation in controls) {
-    action = controls[operation];
+    action = original(controls[operation]);
   }
   return { operation, action, text, confidence: opAnswer.confidence, latencyMs, inputTokens, alternatives, degraded };
 }

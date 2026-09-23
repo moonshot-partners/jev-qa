@@ -50,6 +50,18 @@ export function decideVerdict(input: VerdictInput): { verdict: Verdict; reason: 
     return { verdict: 'ERROR', reason: input.error.split('\n')[0] };
   }
 
+  // A failed expectation is product signal for EVERY kind (README: "FAIL: a fresh finding, or
+  // a failed expect") — including a smoke or adversarial scenario whose later phase could not
+  // start because its start check reported ok:false. Only acceptance scenarios are REQUIRED to
+  // carry expectations; any kind that has them is held to them.
+  const failedExpect = (input.expectResults ?? []).map((r, i) => ({ r, i })).filter(({ r }) => !r.ok);
+  if (failedExpect.length) {
+    const reason = failedExpect
+      .map(({ r, i }) => `${r.phase ? `phase "${r.phase}" ` : ''}expect #${i} ${keyOf(r.assertion)}: expected ${r.expected}, actual ${r.actual}`)
+      .join('; ');
+    return { verdict: 'FAIL', reason };
+  }
+
   if (input.kind === 'smoke') {
     const reason = (input.jevDone ? 'Jev DONE' : input.loopReason) + knownSuffix;
     return { verdict: 'PASS', reason };
@@ -77,11 +89,6 @@ export function decideVerdict(input: VerdictInput): { verdict: Verdict; reason: 
     return { verdict: 'BLOCKED', reason: input.loopReason };
   }
   const results = input.expectResults ?? [];
-  const failed = results.map((r, i) => ({ r, i })).filter(({ r }) => !r.ok);
-  if (failed.length) {
-    const reason = failed.map(({ r, i }) => `expect #${i} ${keyOf(r.assertion)}: expected ${r.expected}, actual ${r.actual}`).join('; ');
-    return { verdict: 'FAIL', reason };
-  }
   return { verdict: 'PASS', reason: `Jev DONE + ${results.length} assertions${knownSuffix}` };
 }
 
