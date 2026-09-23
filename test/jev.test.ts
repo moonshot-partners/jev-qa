@@ -52,6 +52,9 @@ test('buildBody: text_value criteria say which inputs were already typed and whe
   assert.match(criteria.email, /already typed into "«email:1»"|already typed into "Email"/);
   assert.doesNotMatch(criteria.zip, /already typed/);
   assert.equal(JSON.stringify(body).includes('a@b.test'), false, 'the label is scrubbed like every other surface');
+  const failed: HistoryEntry[] = [{ action: 'ZIP', kind: 'fill', text: 'E1 6AN', page_changed: false, failed: true }];
+  const zipCriteria = (buildBody(obs, 'fill the form', inputs, failed).body as { questions: { text_value: { criteria: Record<string, string> } } }).questions.text_value.criteria;
+  assert.doesNotMatch(zipCriteria.zip, /already typed/, 'a fill that never executed does not count as typed');
 });
 
 // --- round 7 (M1): goal and history action labels were never redacted at all -----------------

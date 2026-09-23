@@ -289,7 +289,7 @@ that value out of every request surface; list its key under the scenario's
 
 Every harness lesson from the spike's `MORNING.md` survives extraction:
 
-0. On a multi-field form, a field that already holds another scenario input THIS RUN TYPED THERE (a prefilled value that merely equals an input does not count) is never overwritten with a different one: the fill goes to the empty (or foreign) target Jev ranked next-best, or — outside adversarial runs, which feed every input into one control by design — is skipped so Jev re-decides on a fresh observation — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
+0. On a multi-field form (never in an adversarial run, which feeds every input into one control by design, and never over a target an `inputFields` hint chose), a field that already holds another scenario input THIS RUN TYPED THERE (a prefilled value that merely equals an input does not count) is never overwritten with a different one: the fill goes to the empty (or foreign) target Jev ranked next-best, or is skipped so Jev re-decides on a fresh observation. A fill that never executed (detached, occluded) is recorded as failed and never counts as "already typed" — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
 1. Hostile strings live in scenario `inputs`, never in a prompt — `src/jev.ts` (Jev only ranks offered targets/inputs, never generates text; `buildBody()` additionally redacts every occurrence of an input value out of everything else in the request — see guard 21).
 2. Hover-opened menus toggle closed on the first click after hover — `src/browser.ts:58`.
 3. Repeat guard: retake Jev's next-best target (or scroll) when it re-picks its last action — `src/runner.ts:140`.
@@ -474,8 +474,9 @@ longer one cannot expose its tail, and always before any clipping, so a cut neve
 prefix of a secret behind — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
-run's own outputs, for a password set during the run. Such a scenario keeps **no video**:
-a recording shows whatever the page showed, a typed password included, and cannot be masked.
+run's own outputs, for a password set during the run. Such a scenario keeps **no video and
+no final screenshot**: an image shows whatever the page showed, a typed password included,
+and cannot be masked.
 
 **Not covered:** a value the run never typed — e.g. a one-time token inside the url a start
 check returned — is scrubbed from Jev requests by the generic `«token:N»` rule but persists

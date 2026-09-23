@@ -358,6 +358,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // over the previous one IS the intended pattern (guard 4 submits it first).
       // An `inputFields` hint binds the chosen input to its field: retarget the fill to the
       // offered control whose label matches, whatever target Jev named (see scenario.ts).
+      let retargetedByHint = false;
       if (d.action.kind === 'fill' && d.text !== null) {
         const key = Object.entries(phaseInputs).find(([, v]) => v === d.text)?.[0];
         const hinted = key !== undefined ? hintedTarget(phaseFields[key], obs.actions) : undefined;
@@ -365,20 +366,21 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
           trail[trail.length - 1].label += ` → inputFields: ${mask(hinted.label).slice(0, 40)}`;
           d.action = hinted;
         }
+        retargetedByHint = hinted !== undefined;
       }
       const controlKey = (a: Action) => `${a.frame ?? 0}:${a.node}`;
       const holdsOurs = (a: Action) => !!a.value && filledByUs.get(controlKey(a)) === a.value;
-      if (d.action.kind === 'fill' && d.text !== null && holdsOurs(d.action) && d.action.value !== d.text) {
+      // Never in an adversarial run (every hostile input goes into the same control by design —
+      // README "Guards"), never over a target an inputFields hint chose.
+      if (kind !== 'adversarial' && !retargetedByHint && d.action.kind === 'fill' && d.text !== null && holdsOurs(d.action) && d.action.value !== d.text) {
         const holdsNothingOfOurs = (a: Action) => a.kind === 'fill' && (!holdsOurs(a) || a.value === d.text);
         const alt = d.alternatives.find(holdsNothingOfOurs);
         if (alt) {
           trail[trail.length - 1].label += ` → holds another input, not overwritten: ${mask(alt.label).slice(0, 40)}`;
           d.action = alt;
-        } else if (kind !== 'adversarial') {
-          // No better target offered. An adversarial scenario feeds every input into the same
-          // control by design (README "Guards"), so it may overwrite; any other kind maps inputs
-          // to fields, and overwriting a filled field can only make the form invalid — skip the
-          // fill and let Jev re-decide on a fresh observation (the stuck detectors end a loop).
+        } else {
+          // No better target offered: overwriting a filled field can only make the form invalid —
+          // skip the fill and let Jev re-decide on a fresh observation (the stuck detectors end a loop).
           trail[trail.length - 1].label += ' → holds another input, not overwritten (no alternative offered)';
           history.push({ action: `${d.action.label} (holds another input, not overwritten)`, kind: 'wait', page_changed: null });
           continue;
@@ -525,7 +527,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       try {
         await act(page, d.action, d.text);
       } catch (e) {
-        history.push({ action: d.action.label, kind: d.action.kind, text: d.text, page_changed: false });
+        history.push({ action: d.action.label, kind: d.action.kind, text: d.text, page_changed: false, failed: true });
         // A fill that never executed never reached the field, let alone the server.
         if (d.action.kind === 'fill' && d.text !== null) {
           submissionEvents.push({ kind: 'fill', text: d.text, ok: false, step });
@@ -720,10 +722,13 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   if (allExpect.length) expectResults = allExpect;
 
   const cleanupErrors: string[] = [];
-  for (const p of ctx.pages()) {
-    await p
-      .screenshot({ path: join(outDir, `${s.name.replace(/\W+/g, '_')}-run${run}-final.png`) })
-      .catch((e) => cleanupErrors.push(`screenshot: ${(e as Error).message}`));
+  // Like the video: a screenshot shows whatever the page showed, a typed password included.
+  if (!s.secretInputs?.length) {
+    for (const p of ctx.pages()) {
+      await p
+        .screenshot({ path: join(outDir, `${s.name.replace(/\W+/g, '_')}-run${run}-final.png`) })
+        .catch((e) => cleanupErrors.push(`screenshot: ${(e as Error).message}`));
+    }
   }
   const { verdict, reason: verdictReason } = decideVerdict({
     kind, jevDone, loopReason, inputs: Object.keys(allInputs).length ? allInputs : undefined, submitted, findings, expectResults, error, missingDetail,

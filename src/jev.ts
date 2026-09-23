@@ -63,7 +63,7 @@ export type Observation = {
   scroll?: { y: number; height: number }; // page scroll position and document height
 };
 
-export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null };
+export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null; failed?: boolean };
 
 // null = no degradation was needed. Otherwise: TypeSafe's edge WAF blocked
 // the normal request and the runner retried with less (see decide()'s ladder).
@@ -429,7 +429,7 @@ export function buildBody(
     // retyped them into whatever field it was looking at.
     const typedInto = new Map<string, string>();
     for (const h of history) {
-      if (h.kind !== 'fill' || h.text == null) continue;
+      if (h.kind !== 'fill' || h.text == null || h.failed) continue; // a fill that never executed typed nothing
       const k = valueToKey.get(h.text);
       if (k !== undefined && !typedInto.has(k)) typedInto.set(k, h.action);
     }

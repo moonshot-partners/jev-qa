@@ -3,7 +3,7 @@
 // from a mailbox"), sets a password there, and asserts on the resulting page. A scripted fake
 // `decide` drives the real runner; no Jev, no LLM. Skipped when JEV_QA_NO_BROWSER is set.
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -134,6 +134,7 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     assert.ok(json.includes(email), 'a plain input stays readable');
     assert.ok(r.trail.some((t) => t.text === '«password»'), 'the trail shows the key in place of the typed secret');
     assert.equal(r.video, undefined, 'no recording is kept for a scenario with secret inputs');
+    assert.equal(existsSync(join(dir, 'out', 'acceptance_phases-run1-final.png')), false, 'no final screenshot either');
   } finally {
     server.close();
   }
