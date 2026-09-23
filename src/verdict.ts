@@ -79,7 +79,9 @@ export function decideVerdict(input: VerdictInput): { verdict: Verdict; reason: 
   const results = input.expectResults ?? [];
   const failed = results.map((r, i) => ({ r, i })).filter(({ r }) => !r.ok);
   if (failed.length) {
-    const reason = failed.map(({ r, i }) => `expect #${i} ${keyOf(r.assertion)}: expected ${r.expected}, actual ${r.actual}`).join('; ');
+    const reason = failed
+      .map(({ r, i }) => `${r.phase ? `phase "${r.phase}" ` : ''}expect #${i} ${keyOf(r.assertion)}: expected ${r.expected}, actual ${r.actual}`)
+      .join('; ');
     return { verdict: 'FAIL', reason };
   }
   return { verdict: 'PASS', reason: `Jev DONE + ${results.length} assertions${knownSuffix}` };

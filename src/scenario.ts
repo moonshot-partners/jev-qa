@@ -12,6 +12,22 @@ export type ExpectAssertion =
   | { response: { method?: string; url: string; status: number; bodyIncludes?: string; jsonPath?: string; equals?: unknown } }
   | { check: { name: string; args?: unknown } };
 
+// Where a later phase starts: a path/URL, or a config check that RETURNS one (`{ url }` on its
+// result) — e.g. a check that reads a mailbox and returns the link in the message it found.
+export type PhaseStart = string | { check: { name: string; args?: unknown } };
+
+// A phase after the main one: same page/context (cookies, login carry over), a new start, goal,
+// step budget and expectations. Runs only when the previous phase reached Jev DONE with every
+// expectation met; a phase's own inputs add to (and can override) the scenario's.
+export type Phase = {
+  name?: string;
+  start: PhaseStart;
+  goal: string;
+  inputs?: Record<string, string>;
+  maxSteps?: number;
+  expect?: ExpectAssertion[];
+};
+
 export type Scenario = {
   name: string;
   kind?: 'smoke' | 'adversarial' | 'acceptance';
@@ -23,7 +39,45 @@ export type Scenario = {
   expect?: ExpectAssertion[];
   mutates?: boolean;
   intent?: string;
+  then?: Phase[];
+  // Keys of `inputs` (or a phase's inputs) whose VALUE must not reach results.json / the report:
+  // the trail, the certified list and the reason show «key» instead. (Every input value is
+  // already kept out of Jev requests; this is about the run's own outputs.)
+  secretInputs?: string[];
 };
+
+// The literal a scenario author writes wherever a per-run unique value belongs (an email, a
+// name, a search term): replaced once per run, everywhere in the scenario except its `name`.
+export const RUN_PLACEHOLDER = '{{run}}';
+
+// Short, url/email-safe, unique per run: base-36 time (ms) + 4 random base-36 chars.
+export function newRunId(): string {
+  const rand = Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, '0');
+  return `${Date.now().toString(36)}${rand}`;
+}
+
+// PURE: a deep copy of the scenario with every occurrence of `{{run}}` in every string —
+// start, goal, inputs, expect, phases (including check args) — replaced by `runId`. `name` is
+// left alone: results are grouped and reported by it, and it must stay stable across runs.
+export function applyRunId<T extends { name: string }>(scenario: T, runId: string): T {
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') return v.split(RUN_PLACEHOLDER).join(runId);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+    return v;
+  };
+  const { name, ...rest } = scenario;
+  return { name, ...(walk(rest) as object) } as T;
+}
+
+// The phases a run executes in order: the scenario's own fields first, then each `then` entry
+// (named "then #n" when unnamed).
+export function scenarioPhases(s: Scenario): (Phase & { name: string })[] {
+  return [
+    { name: 'main', start: s.start, goal: s.goal, inputs: s.inputs, maxSteps: s.maxSteps, expect: s.expect },
+    ...(s.then ?? []).map((p, i) => ({ ...p, name: p.name ?? `then #${i + 1}` })),
+  ];
+}
 
 const EXPECT_KEYS = ['url', 'text', 'absentText', 'element', 'response', 'check'];
 
@@ -56,6 +110,43 @@ function validateExpect(file: string, scenarioName: string, expect: unknown): as
   });
 }
 
+function validateInputs(file: string, scenarioName: string, inputs: unknown, where: string): void {
+  const ok = inputs && typeof inputs === 'object' && !Array.isArray(inputs) && Object.values(inputs as object).every((v) => typeof v === 'string');
+  if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputs must be an object of string values`);
+}
+
+function validatePhases(file: string, scenarioName: string, then: unknown, config: Config): asserts then is Phase[] {
+  if (!Array.isArray(then)) throw new Error(`${file}: scenario "${scenarioName}".then must be an array of phases`);
+  then.forEach((p, i) => {
+    const where = `.then[${i}]`;
+    if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Error(`${file}: scenario "${scenarioName}"${where} must be an object`);
+    const ph = p as Record<string, unknown>;
+    if (ph.name !== undefined && (typeof ph.name !== 'string' || ph.name.length === 0)) {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.name must be a non-empty string when present`);
+    }
+    const start = ph.start as unknown;
+    const check = start && typeof start === 'object' && !Array.isArray(start) ? (start as { check?: unknown }).check : undefined;
+    if (typeof start === 'string') {
+      if (start.length === 0) throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }`);
+    } else if (check && typeof check === 'object' && typeof (check as { name?: unknown }).name === 'string') {
+      const name = (check as { name: string }).name;
+      if (!config.checks?.[name]) {
+        throw new Error(`${file}: scenario "${scenarioName}"${where}.start.check references unknown check "${name}" (not in config.checks)`);
+      }
+    } else {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }`);
+    }
+    if (typeof ph.goal !== 'string' || ph.goal.length === 0) {
+      throw new Error(`${file}: scenario "${scenarioName}"${where} is missing the required string field "goal"`);
+    }
+    if (ph.expect !== undefined) validateExpect(file, `${scenarioName}${where}`, ph.expect);
+    if (ph.inputs !== undefined) validateInputs(file, scenarioName, ph.inputs, where);
+    if (ph.maxSteps !== undefined && typeof ph.maxSteps !== 'number') {
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.maxSteps must be a number when present`);
+    }
+  });
+}
+
 function validateScenario(file: string, s: unknown, config: Config): asserts s is Scenario {
   if (!s || typeof s !== 'object') throw new Error(`${file}: each scenario entry must be an object`);
   const sc = s as Record<string, unknown>;
@@ -75,6 +166,17 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
     throw new Error(`${file}: scenario "${sc.name}" is missing the required string field "goal"`);
   }
   if (sc.expect !== undefined) validateExpect(file, sc.name, sc.expect);
+  if (sc.inputs !== undefined) validateInputs(file, sc.name, sc.inputs, '');
+  if (sc.then !== undefined) validatePhases(file, sc.name, sc.then, config);
+  if (sc.secretInputs !== undefined) {
+    const known = new Set([
+      ...Object.keys((sc.inputs as object) ?? {}),
+      ...((sc.then as Phase[] | undefined) ?? []).flatMap((p) => Object.keys(p.inputs ?? {})),
+    ]);
+    if (!Array.isArray(sc.secretInputs) || !sc.secretInputs.every((k) => typeof k === 'string' && known.has(k))) {
+      throw new Error(`${file}: scenario "${sc.name}".secretInputs must be an array of input keys (from inputs or a phase's inputs)`);
+    }
+  }
 
   // Round 7 (M5): a PRESENT but non-string kind (e.g. 0, true, {}) used to fall through to
   // inference below, silently swallowing an obviously-wrong scenario file — only an ABSENT

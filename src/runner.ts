@@ -11,7 +11,7 @@ import { evaluate, type ExpectResult } from './expect.ts';
 import { decide as realDecide, newPseudonyms, type Decision, type HistoryEntry, type Observation } from './jev.ts';
 import { DEFAULT_CRASH_TEXT, drainPending, newSink, record, watch, type Finding, type RequestRecord, type ResponseRecord } from './oracles.ts';
 import { renderReport } from './report.ts';
-import type { Scenario } from './scenario.ts';
+import { applyRunId, newRunId, scenarioPhases, type Scenario } from './scenario.ts';
 import { needsRescue, partialMatch, submittedInputs, uninspectableRequest, type SubmissionEvent } from './submission.ts';
 import { decideVerdict, refusedByEnvironment, type Verdict } from './verdict.ts';
 
@@ -27,7 +27,10 @@ export type Result = {
   jevMsAvg: number;
   inputTokens: number;
   findings: Finding[];
-  trail: { op: string; label: string; text?: string | null; conf: number; ms: number; url: string }[];
+  trail: { op: string; label: string; text?: string | null; conf: number; ms: number; url: string; phase?: string }[];
+  // The per-run unique value substituted for `{{run}}` (see scenario.ts) — recorded so a human
+  // can find what this run created (an account, a record) by the value it typed.
+  runId?: string;
   // Trimmed (no body/postData) so results.json stays small; grounds a scenario author's
   // jsonPath/status facts without needing a live probe run to read them back. Round 10 (Q3):
   // also CAPPED to the most recent 300 entries each on a long/chatty run — the in-memory
@@ -54,6 +57,21 @@ function emptyResult(s: Scenario, kind: Result['kind'], run: number, verdict: Ve
     steps: 0, seconds: 0, jevCalls: 0, jevMsAvg: 0, inputTokens: 0,
     findings: [], trail: [], responses: [], requests: [], submitted: [], intent: s.intent,
   };
+}
+
+// PURE: replaces every occurrence of a `secretInputs` value with its «key» — applied to the
+// run's own outputs (trail text, certified list, reason). Jev requests never carried the value
+// in the first place (jev.ts redact()); this keeps it out of results.json and the report too.
+export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 'secretInputs'>): string {
+  if (!s.secretInputs?.length) return text;
+  const values: Record<string, string> = { ...(s.inputs ?? {}) };
+  for (const p of s.then ?? []) Object.assign(values, p.inputs ?? {});
+  let out = text;
+  for (const key of s.secretInputs) {
+    const v = values[key];
+    if (v) out = out.split(v).join(`«${key}»`);
+  }
+  return out;
 }
 
 // PURE (round 10, Q3): keeps only the most recent `max` entries of an already-chronological
@@ -83,8 +101,13 @@ export function persistedTimeline(
   };
 }
 
-async function runOne(browser: Browser, config: Config, envName: string, s: Scenario, run: number, outDir: string, deps: RunnerDeps = {}): Promise<Result> {
+async function runOne(browser: Browser, config: Config, envName: string, scenario: Scenario, run: number, outDir: string, deps: RunnerDeps = {}): Promise<Result> {
   const decide = deps.decide ?? realDecide;
+  // One unique value per run, substituted for `{{run}}` everywhere in the scenario but its name.
+  const runId = newRunId();
+  const s = applyRunId(scenario, runId);
+  const phases = scenarioPhases(s);
+  const mask = (text: string) => maskSecrets(text, s);
   const kind = s.kind ?? 'acceptance';
   const env = config.environments[envName];
   if (refusedByEnvironment(s, env)) {
@@ -127,6 +150,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, recordVideo: { dir: videosDir, size: { width: 640, height: 400 } } });
   let page: Page | undefined;
   let expectResults: ExpectResult[] | undefined;
+  const allExpect: ExpectResult[] = [];
   let findings: Finding[] = [];
   let responses: ResponseRecord[] = [];
   let requests: RequestRecord[] = [];
@@ -145,6 +169,39 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
     await config.beforeEach?.(page);
 
+    for (let phaseIndex = 0; phaseIndex < phases.length; phaseIndex++) {
+    const phase = phases[phaseIndex];
+    const phaseLabel = phaseIndex ? phase.name : undefined;
+    const phaseInputs: Record<string, string> = { ...(s.inputs ?? {}), ...(phase.inputs ?? {}) };
+    if (phaseIndex) {
+      // A later phase starts on the SAME page/context: a path/URL, or a config check that
+      // returns one (e.g. the set-password link read from a mailbox). A check that reports
+      // `ok: false` is a failed expectation of this phase (FAIL, named); one that reports ok
+      // without a url is a config bug (ERROR).
+      let startUrl: string;
+      if (typeof phase.start === 'string') {
+        startUrl = phase.start;
+      } else {
+        const { name, args } = phase.start.check;
+        const fn = config.checks?.[name];
+        if (!fn) throw new Error(`phase "${phase.name}": no check named "${name}" in config.checks`);
+        const r = await fn({ env, role: s.role, page, request: ctx.request }, args);
+        await drainPending(sink, 5, 3_000);
+        if (!r.ok) {
+          allExpect.push({ assertion: { check: { name, args } }, ok: false, expected: `check "${name}" returns a start url`, actual: r.detail, phase: phase.name });
+          loopReason = `phase "${phase.name}": start check "${name}" failed: ${r.detail}`;
+          break;
+        }
+        if (!r.url) throw new Error(`phase "${phase.name}": start check "${name}" reported ok but returned no url`);
+        startUrl = r.url;
+      }
+      await page.goto(startUrl.startsWith('http') ? startUrl : baseUrl + startUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+      await config.beforeEach?.(page);
+      history.length = 0;
+      jevDone = false;
+      loopReason = 'step budget used up';
+    }
     let unchanged = 0;
     let blockedRetries = 0;
     // The most recent SUCCESSFUL fill, tracked independently of `history` — a BLOCKED settle
@@ -168,23 +225,24 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
       ];
       const certifiedValues = submittedInputs(eventsSoFar);
       return new Set(
-        Object.entries(s.inputs ?? {})
+        Object.entries(phaseInputs)
           .filter(([, v]) => certifiedValues.has(v))
           .map(([k]) => k),
       );
     };
-    for (step = 1; step <= (s.maxSteps ?? 25); step++) {
+    const firstStep = step + 1;
+    for (step = firstStep; step < firstStep + (phase.maxSteps ?? 25); step++) {
       lastExecutedStep = step;
       reportStep = step;
       const obs: Observation = await observe(page);
       const crash = crashText.find((re) => re.test(obs.text));
       if (crash) record(sink, obs.url, step, 'crash-screen', crash.source, { noise: config.noise, known: config.known });
       const certified = certifiedKeys();
-      const d: Decision = await decide(obs, s.goal, s.inputs ?? {}, history, certified, secrets, pseudonyms);
+      const d: Decision = await decide(obs, phase.goal, phaseInputs, history, certified, secrets, pseudonyms);
       jevMs += d.latencyMs;
       tokens += d.inputTokens;
       const degradedNote = d.degraded ? ` (degraded: ${d.degraded})` : '';
-      trail.push({ op: d.operation, label: (d.action?.label ?? '') + degradedNote, text: d.text, conf: d.confidence, ms: d.latencyMs, url: obs.url });
+      trail.push({ op: d.operation, label: (d.action?.label ?? '') + degradedNote, text: d.text === null ? null : mask(d.text), conf: d.confidence, ms: d.latencyMs, url: obs.url, phase: phaseLabel });
       if (d.operation === 'DONE') {
         jevDone = true;
         loopReason = 'Jev: goal satisfied';
@@ -208,7 +266,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
       // not-yet-pruned key across a gap the repeat guard's "same as immediately-previous decision"
       // check can miss (the same class of gap round 5's `lastFill` fix closed for guard 4).
       if (d.action.kind === 'fill' && d.text !== null && d.action.value === d.text) {
-        const key = Object.entries(s.inputs ?? {}).find(([, v]) => v === d.text)?.[0];
+        const key = Object.entries(phaseInputs).find(([, v]) => v === d.text)?.[0];
         if (key !== undefined && certified.has(key)) {
           // Already certified: never retype an already-submitted value. Pure no-op — reuse the
           // repeat guard's own next-best-target-or-scroll so the run still makes progress.
@@ -280,7 +338,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
         // 250ms for up to 1.5s. Only a value that's actually one of this scenario's own inputs
         // can be recognised this way (certifiedKeys() is keyed off s.inputs); anything else
         // skips straight to the focus+Enter guard below, unchanged from before.
-        const debounceKey = Object.entries(s.inputs ?? {}).find(([, v]) => v === lastFill!.text)?.[0];
+        const debounceKey = Object.entries(phaseInputs).find(([, v]) => v === lastFill!.text)?.[0];
         let debounceCertified = debounceKey !== undefined && certifiedKeys().has(debounceKey);
         if (debounceKey !== undefined && !debounceCertified) {
           const deadline = Date.now() + 1_500;
@@ -386,7 +444,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
     // Both this rule and the mid-loop one above press Enter in the focused field — see
     // README "Guards" for why adversarial scenarios must target non-mutating inputs.
     if (kind === 'adversarial') {
-      const inputValues = new Set(Object.values(s.inputs ?? {}));
+      const inputValues = new Set(Object.values(phaseInputs));
       // Reuses the outer `lastFill` directly (round 8) rather than re-deriving an equivalent
       // FillEvent from `submissionEvents` — the two are always in sync (both updated together,
       // in the same statement, the moment a fill succeeds) and the outer one also carries
@@ -444,8 +502,9 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
 
     await drainPending(sink, 5, 3_000);
 
-    if (s.expect?.length) {
-      expectResults = await evaluate(s.expect, {
+    let phaseFailed = false;
+    if (phase.expect?.length) {
+      const results = await evaluate(phase.expect, {
         // Round 7 (M4): read lazily, at the moment each assertion actually runs — a `check`
         // assertion earlier in the SAME list can navigate the page, and a `url`/`text` assertion
         // later in the list must see the page AS IT IS THEN, not a snapshot captured before any
@@ -468,6 +527,12 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
       });
       // A `check` assertion can navigate to a crash screen; catch it now, not just before.
       await checkFinalCrash();
+      for (const r of results) allExpect.push(phaseLabel ? { ...r, phase: phaseLabel } : r);
+      phaseFailed = results.some((r) => !r.ok);
+    }
+    if (phaseLabel && !jevDone) loopReason = `phase "${phase.name}": ${loopReason}`;
+    // The next phase runs only on a clean hand-over: Jev DONE here, every expectation met.
+    if (!jevDone || phaseFailed) break;
     }
 
     await page.waitForLoadState('networkidle', { timeout: 3_000 }).catch(() => {});
@@ -503,16 +568,17 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
       if (submitted.has(v)) continue;
       const partial = partialMatch(finalEvents, v);
       if (partial) {
-        missingDetail[k] = `partial match: ${partial.prefixLength} of ${v.length} characters (via ${partial.request.method} ${partial.request.url})`;
+        missingDetail[k] = mask(`partial match: ${partial.prefixLength} of ${v.length} characters (via ${partial.request.method} ${partial.request.url})`);
         continue;
       }
       const candidate = uninspectableRequest(finalEvents, v);
-      if (candidate) missingDetail[k] = `request ${candidate.method} ${candidate.url} body not inspectable`;
+      if (candidate) missingDetail[k] = mask(`request ${candidate.method} ${candidate.url} body not inspectable`);
     }
   } catch (e) {
     error = (e as Error).message;
     findings = [...sink.findings];
   }
+  if (allExpect.length) expectResults = allExpect;
 
   const cleanupErrors: string[] = [];
   for (const p of ctx.pages()) {
@@ -523,7 +589,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
   const { verdict, reason: verdictReason } = decideVerdict({
     kind, jevDone, loopReason, inputs: s.inputs, submitted, findings, expectResults, error, missingDetail,
   });
-  let reason = verdictReason;
+  let reason = mask(verdictReason);
   const video = page?.video();
   await ctx.close().catch((e) => cleanupErrors.push(`ctx.close: ${(e as Error).message}`));
   let videoName: string | undefined;
@@ -549,7 +615,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
     findings, trail,
     ...persistedTimeline(requests, responses),
     video: videoName && `videos/${videoName}`,
-    intent: s.intent, expectResults, submitted: [...submitted],
+    intent: s.intent, expectResults, submitted: [...submitted].map(mask), runId,
   };
 }
 

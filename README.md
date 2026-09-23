@@ -41,7 +41,7 @@ the `scenarios` glob(s); see `src/scenario.ts` for the schema.
 | File | Purpose |
 |---|---|
 | `src/config.ts` | `Config`/`Environment`/`Role` types, `loadConfig`, `resolveBaseUrl`, minimal glob |
-| `src/scenario.ts` | `Scenario` type, JSON loading + validation, kind inference |
+| `src/scenario.ts` | `Scenario`/`Phase` types, JSON loading + validation, kind inference; `{{run}}` substitution (`applyRunId`), `scenarioPhases` |
 | `src/jev.ts` | `buildBody()` (pure, redacts every input value) + `decide()` (fetch, retry, edge-block ladder, validate) |
 | `src/browser.ts` | Playwright observe/act (snapshot-driven, coordinate input); merges every child frame's snapshot into the observation (`frame` index + page coordinates, two-sided hit test) |
 | `src/snapshot.js` | In-page DOM snapshot (MIT, `snapshot.LICENSE`); runs once per frame; password fields listed by name only, their value never read |
@@ -49,7 +49,7 @@ the `scenarios` glob(s); see `src/scenario.ts` for the schema.
 | `src/expect.ts` | Pure `evaluate()` of `expect` assertions against a captured page state |
 | `src/submission.ts` | Pure `submittedInputs()`: STRONG-ONLY (round 8) — an own-origin request that demonstrably carries the value, in the fill's own window; `uninspectableRequest()` flags a plausible-but-unconfirmable candidate for a more specific BLOCKED reason |
 | `src/verdict.ts` | Pure `decideVerdict()` + `refusedByEnvironment()` |
-| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop, parallel queue, results.json |
+| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop (once per phase), parallel queue, results.json; `maskSecrets` |
 | `src/report.ts` | HTML grid report + `summarize()` |
 | `src/replay.ts` | `replayUrls`/`replayRun`: re-request findings without Jev in the loop |
 | `src/env.ts` | Minimal `.env` loader |
@@ -353,14 +353,67 @@ The loader dynamic-imports the file and validates it at run time.
 | `guardRequest` | `(url, env) => string \| { refuse }` | Applied to every request the engine sends outside the browser (`replay`), which `setupContext` routes cannot see. Return the URL to send (possibly rewritten) or `{ refuse: reason }`; a refused URL is reported as `REFUSED` and never sent. Keep it consistent with the `setupContext` rails. |
 | `beforeEach` | `(page) => Promise<void>` | Runs after the start navigation, before step 1 (cookie banners). |
 | `smoke` | `() => Scenario[]` | Generated scenarios; kind forced to `smoke`; validated like JSON ones. |
-| `checks` | `{ [name]: (ctx, args) => Promise<{ ok, detail }> }` | App-owned read-only assertions used by `expect: [{ check: { name, args } }]`. `ctx` has `env`, `role`, `page`, `request`. |
+| `checks` | `{ [name]: (ctx, args) => Promise<{ ok, detail, url? }> }` | App-owned read-only assertions used by `expect: [{ check: { name, args } }]`. `ctx` has `env`, `role`, `page`, `request`. A check may also return `url`: that lets it START a later phase (`then[].start: { check }`) — e.g. read a mailbox and hand back the link in the message. |
 | `redact` | `string[]` or `() => string[]` | Extra secrets that may appear on the page (a role's own email or password). Redacted to `«secret»` before any decision request. |
 | `scenarios` | `string` or `string[]` | Glob(s) relative to the config file's directory, e.g. `scenarios/**/*.json`. |
 
 Scenario fields: `name`, `kind` (`smoke` / `adversarial` / `acceptance`; inferred from the `smoke/` and
 `adversarial/` name prefixes when absent), `role`, `start`, `goal`, `inputs`, `maxSteps`, `expect`,
-`mutates`, `intent`. See `src/scenario.ts` for validation rules (an acceptance scenario needs at least one
-`expect`; an adversarial one needs at least one input).
+`mutates`, `intent`, `then`, `secretInputs`. See `src/scenario.ts` for validation rules (an acceptance
+scenario needs at least one `expect`; an adversarial one needs at least one input).
+
+### Phases: `then`
+
+A scenario can continue past its main goal in one or more **phases**, on the same page and
+context (login and cookies carry over):
+
+```json
+{
+  "name": "acceptance/sign-up",
+  "role": null,
+  "start": "/sign-up",
+  "goal": "register a new account with the email",
+  "inputs": { "email": "qa-{{run}}@example.test" },
+  "expect": [{ "url": "/welcome" }],
+  "then": [
+    {
+      "name": "set password",
+      "start": { "check": { "name": "welcomeLink", "args": { "inbox": "qa-{{run}}@example.test" } } },
+      "goal": "choose the password and submit",
+      "inputs": { "password": "Pw-{{run}}!" },
+      "expect": [{ "url": "/dashboard" }, { "text": "Signed in" }]
+    }
+  ],
+  "secretInputs": ["password"]
+}
+```
+
+- `start` is a path/URL, or `{ check: { name, args? } }`: the config check runs on the current
+  page (it may read a mailbox, an API, a database) and returns `{ ok, detail, url }`; the phase
+  begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run
+  as a named expectation of that phase (`phase "set password" expect #0 check: …`); `ok` without
+  a `url` is a config bug and reports ERROR.
+- Each phase has its own `goal`, `maxSteps` (default 25), `expect`, and `inputs` (merged over the
+  scenario's; the same key in a phase overrides). Jev's history restarts per phase; the oracle,
+  the trail and the step counter continue. The next phase runs only when the previous one
+  reached Jev DONE with every expectation met.
+- Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
+  the verdict is the scenario's as a whole.
+
+### `{{run}}` — a value unique to each run
+
+Anywhere in a scenario's strings (`start`, `goal`, `inputs`, `expect`, every phase and its check
+`args`) — but never in `name` — the literal `{{run}}` is replaced, once per run, by a short
+url/email-safe id (base-36 time + random, e.g. `mf3k2p9q7x1z`). `results.json` records it as
+`runId`, so what a run created can be found by the value it typed. `--repeat 3` produces three
+different ids.
+
+### `secretInputs`
+
+Keys of `inputs` (or a phase's inputs) whose value must not reach `results.json` or the
+report: the trail's typed text, the certified-inputs list and the reason show `«key»` instead.
+Every input value is already kept out of Jev requests (see Secrets); this covers the run's
+own outputs, for a password set during the run.
 
 ## Known limitations
 
@@ -460,6 +513,17 @@ REPLACE guard's own debounce-grace poll (guard 46), not luck or an
 unrelated wait, is what lets a value certify without the runner ever
 forcing an Enter into the field; both values end up submitted and the
 trail carries no `auto-submitted previous value` entry.
+`test/phases.test.ts` covers `newRunId()`, `applyRunId()` (every string but `name`,
+check args included, original untouched), `scenarioPhases()`, `maskSecrets()`, the
+phase-naming verdict reason, and scenario validation of `then`/`secretInputs`.
+`test/phases.browser.test.ts` runs the real runner (fake `decide`) through a
+two-phase scenario: the main phase submits a `{{run}}` email, a config check
+receives the substituted args and returns the second phase's start url, the
+second phase types a `{{run}}` password (`secretInputs`) and its own
+expectations are evaluated and tagged — the certified list carries `«password»`,
+and the value appears nowhere in the result; a second scenario proves a check
+reporting `ok: false` FAILs the run naming the phase, and one returning no url
+reports ERROR.
 `test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
 page embedding an `<iframe>`: the framed input and button are offered with
 page coordinates and `frame: 1`, typing/clicking by those coordinates lands

@@ -15,7 +15,7 @@ export type ExpectState = {
   runCheck: (name: string, args?: unknown) => Promise<{ ok: boolean; detail: string }>;
 };
 
-export type ExpectResult = { assertion: ExpectAssertion; ok: boolean; expected: string; actual: string };
+export type ExpectResult = { assertion: ExpectAssertion; ok: boolean; expected: string; actual: string; phase?: string };
 
 function parseMaybeRegex(s: string): RegExp | null {
   const m = /^\/(.*)\/([a-z]*)$/.exec(s);
