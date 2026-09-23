@@ -8,7 +8,7 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { act, focusAndVerify, observe } from './browser.ts';
 import { resolveBaseUrl, type Config } from './config.ts';
 import { evaluate, type ExpectResult } from './expect.ts';
-import { decide as realDecide, newPseudonyms, redactValue, type Decision, type HistoryEntry, type Observation } from './jev.ts';
+import { decide as realDecide, newPseudonyms, redactValue, type Action, type Decision, type HistoryEntry, type Observation } from './jev.ts';
 import { DEFAULT_CRASH_TEXT, drainPending, newSink, record, watch, type Finding, type RequestRecord, type ResponseRecord } from './oracles.ts';
 import { renderReport } from './report.ts';
 import { applyRunId, newRunId, scenarioInputs, scenarioPhases, type Scenario } from './scenario.ts';
@@ -53,9 +53,10 @@ export type RunnerDeps = { decide?: typeof realDecide };
 
 function emptyResult(s: Scenario, kind: Result['kind'], run: number, verdict: Verdict, reason: string): Result {
   return {
-    name: s.name, kind, run, verdict, reason,
+    name: s.name, kind, run, verdict, reason: maskSecrets(reason, s),
     steps: 0, seconds: 0, jevCalls: 0, jevMsAvg: 0, inputTokens: 0,
-    findings: [], trail: [], responses: [], requests: [], submitted: [], intent: s.intent,
+    findings: [], trail: [], responses: [], requests: [], submitted: [],
+    intent: s.intent === undefined ? undefined : maskSecrets(s.intent, s),
   };
 }
 
@@ -69,7 +70,25 @@ export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 
   // Every value the key ever had (a phase may reuse a key with a new value), in every form the
   // Jev-side redaction covers (raw, percent/form-encoded — a GET form carries it that way in a
   // request URL — HTML-escaped, JSON-escaped): redactValue() is the same routine buildBody() uses.
-  for (const key of s.secretInputs) for (const v of values[key] ?? []) out = redactValue(out, v, `«${key}»`);
+  // Longest value first: a shorter value that prefixes a longer one would otherwise be replaced
+  // first and leave the longer one's tail exposed.
+  const pairs = s.secretInputs.flatMap((key) => (values[key] ?? []).map((v) => ({ key, v }))).sort((a, b) => b.v.length - a.v.length);
+  for (const { key, v } of pairs) out = redactValue(out, v, `«${key}»`);
+  return out;
+}
+
+// PURE: every input across every phase, flattened for the verdict's "each input reached the
+// server" rule: a key reused with a second value in a later phase appears again as `key#2`
+// (`#3`, … — skipping any name a real input already uses).
+export function flattenInputs(byKey: Record<string, string[]>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, vs] of Object.entries(byKey)) {
+    vs.forEach((v, i) => {
+      let name = i ? `${k}#${i + 1}` : k;
+      for (let n = i + 1; name in out || (name !== k && name in byKey); n++) name = `${k}#${n + 1}`;
+      out[name] = v;
+    });
+  }
   return out;
 }
 
@@ -120,8 +139,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   const mask = (text: string) => maskSecrets(text, s);
   // Every input across every phase, flattened for the verdict's "each input reached the server"
   // rule: a key reused with a second value in a later phase appears again as `key#2`.
-  const allInputs: Record<string, string> = {};
-  for (const [k, vs] of Object.entries(scenarioInputs(s))) vs.forEach((v, i) => (allInputs[i ? `${k}#${i + 1}` : k] = v));
+  const allInputs: Record<string, string> = flattenInputs(scenarioInputs(s));
   const kind = s.kind ?? 'acceptance';
   const env = config.environments[envName];
   if (refusedByEnvironment(s, env)) {
@@ -224,6 +242,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     let unchanged = 0;
     let blockedRetries = 0;
     let blockedScrolls = 0;
+    let lastBlockedScrollY = -1;
     // The most recent SUCCESSFUL fill, tracked independently of `history` — a BLOCKED settle
     // retry pushes its own 'wait' entry onto history, and the mid-loop auto-Enter guard below
     // used to look only at the immediately previous history entry, so fill -> BLOCKED retry ->
@@ -279,8 +298,12 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         // fields): while the page continues below the fold, SCROLL rather than give up — up to
         // a few screens, each its own step. Only then do client-rendered pages get their two
         // settle chances (they often look empty for a moment).
+        // Stop scrolling once a scroll moved nothing (root scrolling disabled, a fixed layout that
+        // still reports more document below): the settle retries then run as before.
         const scroll = obs.actions.find((a) => a.id === 'scroll_down');
-        if (scroll && blockedScrolls++ < 5) {
+        const scrollMoved = obs.scroll?.y !== lastBlockedScrollY;
+        lastBlockedScrollY = obs.scroll?.y ?? -1;
+        if (scroll && scrollMoved && blockedScrolls++ < 5) {
           await act(page, scroll, null);
           history.push({ action: 'Scroll down (auto: nothing to do above the fold)', kind: 'scroll', page_changed: null });
           trail[trail.length - 1].label += ' (auto-scrolled: more page below)';
@@ -294,6 +317,22 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         }
         loopReason = 'Jev: no operation can progress';
         break;
+      }
+      // On a multi-field form, a field that already holds ANOTHER scenario input is done: do
+      // not overwrite it with a different input when Jev itself ranked an empty (or foreign)
+      // fill target as its next-best choice. Jev's target and text questions are answered
+      // independently, so on a long form it can pair the postcode with the country field it
+      // happened to look at, or retype a first name into the email — the form then never
+      // validates. Only Jev's own alternatives are considered, never any empty field on the
+      // page: on a one-field page (an adversarial search box) typing the next hostile input
+      // over the previous one IS the intended pattern (guard 4 submits it first).
+      if (d.action.kind === 'fill' && d.text !== null && d.action.value && d.action.value !== d.text && Object.values(phaseInputs).includes(d.action.value)) {
+        const holdsNothingOfOurs = (a: Action) => a.kind === 'fill' && (!a.value || !Object.values(phaseInputs).includes(a.value) || a.value === d.text);
+        const alt = d.alternatives.find(holdsNothingOfOurs);
+        if (alt) {
+          trail[trail.length - 1].label += mask(` → holds another input, not overwritten: ${alt.label.slice(0, 40)}`);
+          d.action = alt;
+        }
       }
       // L2 harness fallback: Jev picked TYPE_TEXT with a value that's ALREADY the target field's
       // current content (`d.action.value`, this step's own fresh observation) — pruning (above)
@@ -549,6 +588,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         url: () => page!.url(),
         bodyText: () => page!.innerText('body').catch(() => ''),
         responses: sink.responses,
+        fromStep: phaseFirstStep,
         isElementVisible: async (role, name) => page!.getByRole(role as Parameters<Page['getByRole']>[0], { name }).first().isVisible().catch(() => false),
         runCheck: async (name, args) => {
           const fn = config.checks?.[name];
@@ -652,14 +692,14 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     seconds: Math.round((performance.now() - started) / 100) / 10,
     jevCalls: calls, jevMsAvg: calls ? Math.round(jevMs / calls) : 0, inputTokens: tokens,
     findings: findings.map((f) => ({ ...f, detail: mask(f.detail), url: mask(f.url) })),
-    trail,
+    trail: trail.map((t) => (t.phase === undefined ? t : { ...t, phase: mask(t.phase) })),
     requests: timeline.requests.map((r) => ({ ...r, url: mask(r.url) })),
     responses: timeline.responses.map((r) => ({ ...r, url: mask(r.url) })),
     requestsOmitted: timeline.requestsOmitted,
     responsesOmitted: timeline.responsesOmitted,
     video: videoName && `videos/${videoName}`,
     intent: s.intent === undefined ? undefined : mask(s.intent),
-    expectResults: expectResults?.map((r) => ({ ...r, assertion: maskDeep(r.assertion, mask) as ExpectResult['assertion'], expected: mask(r.expected), actual: mask(r.actual) })),
+    expectResults: expectResults?.map((r) => ({ ...r, assertion: maskDeep(r.assertion, mask) as ExpectResult['assertion'], expected: mask(r.expected), actual: mask(r.actual), phase: r.phase === undefined ? undefined : mask(r.phase) })),
     submitted: [...submitted].map(mask), runId,
   };
 }

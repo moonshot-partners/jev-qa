@@ -43,6 +43,7 @@ async function fixture(): Promise<{ server: Server; base: string }> {
     res.writeHead(200, { 'content-type': 'text/html' });
     if (path === '/inner') res.end(INNER_HTML);
     else if (path === '/covered') res.end(OUTER_HTML(true));
+    else if (path === '/sibling') res.end(OUTER_HTML(false).replace('<div style="height:1200px"></div>', '<iframe id="g" src="/inner" style="position:absolute;left:0;top:0;width:100%;height:100%;border:0;opacity:0.01"></iframe><div style="height:1200px"></div>'));
     else res.end(OUTER_HTML(false));
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -124,6 +125,37 @@ test('frames: a target inside a frame is refused when something in the main docu
     // … but the parent-side hit test refuses the input, and nothing reaches the field.
     await assert.rejects(() => act(page, card!, '4242'), /occluded/);
     assert.equal(await inner.evaluate(() => (document.getElementById('card') as HTMLInputElement).value), '', 'nothing was typed');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+test('frames: a target inside a frame is refused when a SIBLING frame is laid over it (any iframe under the point is not enough)', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    await page.goto(base + '/sibling');
+    const obs = await observe(page);
+    const target = (await (await page.$('#f'))!.contentFrame())!;
+    const cards = obs.actions.filter((a) => a.label === 'Card number' && a.kind === 'fill');
+    assert.equal(cards.length, 2, 'both frames offer a card field');
+    // The frame #f sits under the full-page sibling #g: input into #f must be refused (an
+    // <iframe> under the point is not enough — it has to be #f's own), #g's own field works.
+    let refused = 0;
+    for (const a of cards) {
+      try {
+        await act(page, a, 'probe');
+      } catch (e) {
+        assert.match((e as Error).message, /occluded/);
+        refused++;
+      }
+    }
+    assert.equal(refused, 1, 'exactly the covered frame was refused');
+    assert.equal(await target.evaluate(() => (document.getElementById('card') as HTMLInputElement).value), '', 'nothing reached the covered frame');
     await page.close();
   } finally {
     await browser?.close();

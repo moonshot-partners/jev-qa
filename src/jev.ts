@@ -60,6 +60,7 @@ export type Observation = {
   omitted_actions: number;
   w?: number; // viewport size, as the snapshot saw it (used to clip frame-hosted targets)
   h?: number;
+  scroll?: { y: number; height: number }; // page scroll position and document height
 };
 
 export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null };
@@ -130,7 +131,8 @@ function numericEntity(value: string, format: (code: number) => string): string 
 // This exact gap was the real WAF trigger (round 7 addendum): encodeURIComponent(`' OR 1=1`)
 // leaves the quote as a literal `'`, but the real page's own URL carried it as `%27`.
 function formEncode(percentEncoded: string): string {
-  return percentEncoded.replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+  // `~` too: encodeURIComponent leaves it literal, a browser's form submission sends %7E.
+  return percentEncoded.replace(/[!'()*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
 }
 
 // Every string form a hostile input value could survive as by the time it's embedded somewhere
@@ -363,6 +365,8 @@ export function buildBody(
   }));
   const { elements, targets, controls } = actionSpace(redactedActions);
 
+  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
+
   // L2: keys already certified as submitted (see the function doc comment) are pruned from
   // every input-choosing surface below — not just filtered out of display, but genuinely never
   // offered, so a confused Jev has no way to re-pick a value the harness already knows landed.
@@ -411,14 +415,24 @@ export function buildBody(
     // that already contains the requested value") compares these as literal strings, and a
     // bare "query" next to a redacted "«query»" never matches. Numbered relative to what's
     // actually offered (remainingInputs), so "#1" is always the next uncertified input.
+    // Which inputs were ALREADY typed this phase, and where — from the FULL history, not the
+    // ten-entry `recent_actions` window: on a long form Jev's own "use the first one the recent
+    // actions have not typed yet" rule forgot the first fields once ten actions had passed and
+    // retyped them into whatever field it was looking at.
+    const typedInto = new Map<string, string>();
+    for (const h of history) {
+      if (h.kind !== 'fill' || h.text == null) continue;
+      const k = valueToKey.get(h.text);
+      if (k !== undefined && !typedInto.has(k)) typedInto.set(k, h.action);
+    }
     const criteria: Record<string, string> = {};
     remainingInputs.forEach((k, i) => {
-      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)`;
+      const typed = typedInto.get(k);
+      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)${typed ? `; already typed into "${scrubGeneric(redact(typed, inputs, secrets), pseudonyms)}"` : ''}`;
     });
     questions.text_value = { type: 'choice', criteria, instructions: { goal: redactedGoal, rules: TEXT } };
   }
 
-  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
   const recentActions = history.slice(-10).map((h) => ({
     ...h,
     // M1 (round 7): the free-text action label (e.g. "Search flower") was never redacted at

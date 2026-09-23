@@ -137,6 +137,92 @@ test('phases: the second phase starts at the url a check returns, its inputs and
   }
 });
 
+const TWO_FIELDS_HTML = `<!doctype html><html><body>
+<form method="GET" action="/two-done"><input id="a" name="a" type="text" aria-label="Alpha"><input id="b" name="b" type="text" aria-label="Beta"><button type="submit">Go</button></form>
+</body></html>`;
+
+test('a field that already holds another scenario input is never overwritten: the next empty fill target is used instead', { skip: SKIP }, async () => {
+  const hits: string[] = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    hits.push(url.pathname + url.search);
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(url.pathname === '/two-done' ? '<!doctype html><html><body><p>Done two</p></body></html>' : TWO_FIELDS_HTML);
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-two-'));
+  try {
+    // Types alpha into Alpha, then (wrongly) beta into Alpha again, offering Beta as the alternative.
+    const wrongDecide = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (new URL(obs.url).pathname === '/two-done') return DONE;
+      const alpha = obs.actions.find((a) => a.label === 'Alpha' && a.kind === 'fill')!;
+      const beta = obs.actions.find((a) => a.label === 'Beta' && a.kind === 'fill')!;
+      const fills = history.filter((h) => h.kind === 'fill').length;
+      if (fills === 0) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.alpha };
+      if (fills === 1) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.beta, alternatives: [beta] };
+      return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+    };
+    const s: Scenario = { name: 'acceptance/two', kind: 'acceptance', role: null, start: '/two', goal: 'fill both', inputs: { alpha: 'one', beta: 'two' }, maxSteps: 6, expect: [{ url: '/two-done' }] };
+    const [r] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [s], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide: wrongDecide } });
+    assert.equal(r.verdict, 'PASS', r.reason);
+    assert.ok(hits.some((h) => h.startsWith('/two-done?') && new URLSearchParams(h.split('?')[1]).get('a') === 'one' && new URLSearchParams(h.split('?')[1]).get('b') === 'two'), `Alpha kept "one" and Beta got "two"; hits: ${hits.join(' ')}`);
+    assert.ok(r.trail.some((t) => t.label.includes('holds another input, not overwritten: Beta')), 'the guard redirected the fill to the empty field');
+  } finally {
+    server.close();
+  }
+});
+
+test('a REFUSED run masks a secret quoted in its intent; a phase response assertion sees only its own phase\'s traffic', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-refused-'));
+  try {
+    const config: Config = { ...configFor(base, { link: async () => ({ ok: true, detail: '', url: '/b?token=abc' }) }), environments: { ro: { baseUrl: base, mutations: false }, rw: { baseUrl: base, mutations: true } } };
+    const refused: Scenario = { name: 'acceptance/refused', kind: 'acceptance', role: null, start: '/a', goal: 'g', mutates: true, intent: 'uses password Pw-{{run}}!', inputs: { password: 'Pw-{{run}}!' }, expect: [{ url: '/a' }], secretInputs: ['password'] };
+    const [r] = await runAll({ config, dir, envName: 'ro', scenarios: [refused], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide } });
+    assert.equal(r.verdict, 'REFUSED');
+    assert.equal(r.intent, 'uses password «password»');
+    assert.equal(JSON.stringify(r).includes(`Pw-${r.runId ?? '§'}!`), false);
+
+    // Phase 1 sends GET /a-search → 200; phase 2 never does. A `response` assertion for /a-search
+    // on phase 2 must FAIL, not ride on phase 1's response.
+    const windowed: Scenario = {
+      name: 'acceptance/response-window', kind: 'acceptance', role: null, start: '/a', goal: 'register', inputs: { email: 'qa-{{run}}@example.test' },
+      expect: [{ response: { method: 'GET', url: '/a-search', status: 200 } }],
+      then: [{ start: { check: { name: 'link' } }, goal: 'set', inputs: { password: 'Pw-{{run}}!' }, expect: [{ response: { method: 'GET', url: '/a-search', status: 200 } }] }],
+    };
+    calls.length = 0;
+    const [w] = await runAll({ config, dir, envName: 'rw', scenarios: [windowed], concurrency: 1, repeat: 1, outDir: join(dir, 'out2'), deps: { decide } });
+    assert.equal(w.verdict, 'FAIL', w.reason);
+    assert.match(w.reason, /phase "then #1" expect #1 response: /);
+    assert.equal(w.expectResults![0].ok, true, 'the main phase\'s own response assertion passes');
+  } finally {
+    server.close();
+  }
+});
+
+const NOSCROLL_HTML = `<!doctype html><html><head><style>html,body{overflow:hidden;height:100%}</style></head><body>
+<div style="height:3000px">tall but the root cannot scroll</div>
+</body></html>`;
+
+test('BLOCKED auto-scroll stops as soon as a scroll moves nothing, leaving the settle retries their turn', { skip: SKIP }, async () => {
+  const server = createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(NOSCROLL_HTML); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-noscroll-'));
+  try {
+    const blocked = async (): Promise<Decision> => ({ ...DONE, operation: 'BLOCKED' });
+    const s: Scenario = { name: 'smoke/noscroll', kind: 'smoke', role: null, start: '/', goal: 'x', maxSteps: 10 };
+    const [r] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [s], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide: blocked } });
+    const scrolls = r.trail.filter((t) => t.label.includes('auto-scrolled')).length;
+    assert.ok(scrolls <= 1, `at most one ineffective scroll, got ${scrolls}`);
+    assert.match(r.reason, /no operation can progress/);
+    assert.ok(r.steps <= 4, `the settle retries ran and the run ended early (${r.steps} steps)`);
+  } finally {
+    server.close();
+  }
+});
+
 const TALL_HTML = `<!doctype html><html><body>
 <form method="GET" action="/tall-done"><input id="q" name="q" type="text" aria-label="Email"><div style="height:1600px"></div><button type="submit">Go</button></form>
 </body></html>`;

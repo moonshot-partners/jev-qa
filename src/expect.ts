@@ -11,6 +11,9 @@ export type ExpectState = {
   url: () => string;
   bodyText: () => Promise<string>;
   responses: ResponseRecord[];
+  // Only responses recorded at this step or later count (a phase's own window): a later phase's
+  // `response` assertion must not be satisfied by an earlier phase's traffic.
+  fromStep?: number;
   isElementVisible: (role: string, name: string) => Promise<boolean>;
   runCheck: (name: string, args?: unknown) => Promise<{ ok: boolean; detail: string }>;
 };
@@ -70,7 +73,7 @@ async function evalOne(a: ExpectAssertion, state: ExpectState): Promise<ExpectRe
   if ('response' in a) {
     const { method, url, status, bodyIncludes, jsonPath, equals } = a.response;
     const re = new RegExp(url);
-    const byShape = state.responses.filter((r) => (!method || r.method.toUpperCase() === method.toUpperCase()) && re.test(r.url) && r.status === status);
+    const byShape = state.responses.filter((r) => r.step >= (state.fromStep ?? 0)).filter((r) => (!method || r.method.toUpperCase() === method.toUpperCase()) && re.test(r.url) && r.status === status);
     let match: ResponseRecord | undefined;
     let failDetail = '';
     for (const r of byShape) {

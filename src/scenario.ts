@@ -57,8 +57,9 @@ export function newRunId(): string {
 }
 
 // PURE: a deep copy of the scenario with every occurrence of `{{run}}` in every string —
-// start, goal, inputs, expect, phases (including check args) — replaced by `runId`. `name` is
-// left alone: results are grouped and reported by it, and it must stay stable across runs.
+// start, goal, inputs, expect, phases (including check args) — replaced by `runId`. The
+// scenario's `name` and every phase's `name` are left alone: results are grouped, tagged and
+// reported by them, and they must stay stable across runs (and never carry a run's secret).
 export function applyRunId<T extends { name: string }>(scenario: T, runId: string): T {
   // Only plain JSON-shaped data is rebuilt; anything else (a Date, a RegExp, a class instance a
   // config's smoke() handed a check as args) is passed through untouched.
@@ -72,8 +73,10 @@ export function applyRunId<T extends { name: string }>(scenario: T, runId: strin
     if (v && typeof v === 'object' && plain(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
     return v;
   };
-  const { name, ...rest } = scenario;
-  return { name, ...(walk(rest) as object) } as T;
+  const { name, ...rest } = scenario as T & { then?: { name?: string }[] };
+  const out = { name, ...(walk(rest) as object) } as T & { then?: { name?: string }[] };
+  if (Array.isArray(out.then)) out.then = out.then.map((p, i) => ({ ...p, name: (scenario as { then?: { name?: string }[] }).then?.[i]?.name }));
+  return out;
 }
 
 // Every input value a run can type, across the scenario and all its phases, keyed by input key

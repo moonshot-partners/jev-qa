@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.ts';
-import { maskDeep, maskSecrets } from '../src/runner.ts';
+import { flattenInputs, maskDeep, maskSecrets } from '../src/runner.ts';
 import { applyRunId, loadScenarios, newRunId, RUN_PLACEHOLDER, scenarioInputs, scenarioPhases, type Scenario } from '../src/scenario.ts';
 import { decideVerdict } from '../src/verdict.ts';
 
@@ -95,6 +95,24 @@ test('loadScenarios: an acceptance scenario may carry its only expectation on a 
   const [s] = load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', then: [{ start: '/b', goal: 'h', expect: [{ url: '/done' }] }] }, configWith({}));
   assert.equal(s.expect, undefined);
   assert.throws(() => load({ name: 'acceptance/y', role: null, start: '/', goal: 'g', then: [{ start: '/b', goal: 'h' }] }, configWith({})), /no expect assertions/);
+});
+
+test('maskSecrets: the longest value is masked first, so a value that prefixes a longer one cannot expose its tail', () => {
+  const s = { inputs: { password: 'Rain-2026' }, then: [{ start: '/x', goal: 'g', inputs: { password: 'Rain-2026-next' } }], secretInputs: ['password'] };
+  assert.equal(maskSecrets('/set?pw=Rain-2026-next&old=Rain-2026', s), '/set?pw=«password»&old=«password»');
+});
+
+test('flattenInputs: a reused key gets #2, #3… without colliding with a real input of that name', () => {
+  assert.deepEqual(flattenInputs({ p: ['A', 'B'], 'p#2': ['C'] }), { p: 'A', 'p#3': 'B', 'p#2': 'C' });
+  assert.deepEqual(flattenInputs({ email: ['e'], password: ['p1', 'p2', 'p1'] }), { email: 'e', password: 'p1', 'password#2': 'p2', 'password#3': 'p1' });
+});
+
+test('applyRunId: a phase name is left alone too (it tags results and must never carry a run value)', () => {
+  const s: Scenario = { name: 'x', role: null, start: '/', goal: 'g', then: [{ name: 'phase {{run}}', start: '/b?r={{run}}', goal: 'h {{run}}' }] };
+  const out = applyRunId(s, 'zz');
+  assert.equal(out.then![0].name, 'phase {{run}}');
+  assert.equal(out.then![0].start, '/b?r=zz');
+  assert.equal(out.then![0].goal, 'h zz');
 });
 
 test('scenarioInputs: every key with every value it had across the scenario and its phases', () => {

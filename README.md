@@ -267,9 +267,9 @@ control is offered like any other, with:
 
 Input is unchanged — click at page `x,y`, then type — so a cross-origin card field is
 filled exactly like a main-document one. The hit test before input is two-sided: inside
-the frame the point must land on the target; in the main document it must land on an
-`<iframe>` (a modal, sticky bar or popover laid over the frame refuses the input with
-`target occluded (frame covered)`). `focusAndVerify()` checks `document.activeElement`
+the frame the point must land on the target; in the parent document it must land on this
+frame's OWN `<iframe>` element (a modal, sticky bar, popover — or a sibling frame — laid over
+it refuses the input with `target occluded (frame covered)`). `focusAndVerify()` checks `document.activeElement`
 in the target's own frame.
 
 ### Password fields
@@ -285,6 +285,7 @@ that value out of every request surface; list its key under the scenario's
 
 Every harness lesson from the spike's `MORNING.md` survives extraction:
 
+0. On a multi-field form, a field that already holds another scenario input is never overwritten with a different one when Jev ranked an empty (or foreign) fill target as its next-best choice — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
 1. Hostile strings live in scenario `inputs`, never in a prompt — `src/jev.ts` (Jev only ranks offered targets/inputs, never generates text; `buildBody()` additionally redacts every occurrence of an input value out of everything else in the request — see guard 21).
 2. Hover-opened menus toggle closed on the first click after hover — `src/browser.ts:58`.
 3. Repeat guard: retake Jev's next-best target (or scroll) when it re-picks its last action — `src/runner.ts:140`.
@@ -294,7 +295,7 @@ Every harness lesson from the spike's `MORNING.md` survives extraction:
 7. Known-issue tagging: triaged findings stay in the report as `known:<id>` but never fail a run, whichever oracle raised them (console/response/crash-screen alike) — `src/oracles.ts:36` (`classify`), `src/oracles.ts:47` (`record`, shared by `watch`'s oracles and the runner's own crash checks).
 8. Own-origin 401/403 don't poison the console-error oracle: same-step `known:authz` tagging — `src/oracles.ts:73`.
 9. A crash-screen check runs every step, independent of Jev's reading of the page — `src/runner.ts:117` — **and once more after the loop ends, on the settled final page** (guard 22): the per-step check alone never looks at the page AFTER the LAST action.
-10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
+10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step, and only while a scroll actually moves the page — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
 11. A cookie/consent interstitial is app-specific, so it is a config hook (`beforeEach`), not a hard-coded selector — `src/config.ts:43`, `src/runner.ts:103`.
 12. Generated smoke scenarios (role × page) are config-supplied (`smoke()`), not a separate script, and validated exactly like any other scenario — `src/config.ts:44`, `src/scenario.ts:104`.
 13. End-of-run rescue `Enter`: narrow on purpose — only for `adversarial` scenarios, only when the trailing fill's text is literally one of `s.inputs`' values (never an incidental form field), and only within the last two executed steps — `src/runner.ts:228`. Decides whether to fire by ACTUAL certification (`needsRescue()`, `src/submission.ts`), not by "was there any event at or after this step" — that heuristic suppressed the rescue on evidence that doesn't certify (an inert click, an unrelated poll request), leaving a real hostile input unsubmitted. Never records a submit event if the press itself rejects (true for this rule and guard 4 alike).
@@ -391,6 +392,8 @@ context (login and cookies carry over):
 }
 ```
 
+- A phase's `response` assertions see only the responses recorded during that phase; an
+  earlier phase's traffic never satisfies a later phase's assertion.
 - `start` is a path/URL, or `{ check: { name, args? } }`: the config check runs on the current
   page (it may read a mailbox, an API, a database) and returns `{ ok, detail, url }`; the phase
   begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run
@@ -419,7 +422,7 @@ context (login and cookies carry over):
 ### `{{run}}` — a value unique to each run
 
 Anywhere in a scenario's strings (`start`, `goal`, `inputs`, `expect`, every phase and its check
-`args`) — but never in `name` — the literal `{{run}}` is replaced, once per run, by a short
+`args`) — but never in the scenario's `name` nor a phase's `name` — the literal `{{run}}` is replaced, once per run, by a short
 url/email-safe id (base-36 time + random, e.g. `mf3k2p9q7x1z`). `results.json` records it as
 `runId`, so what a run created can be found by the value it typed. `--repeat 3` produces three
 different ids.
@@ -429,8 +432,9 @@ different ids.
 Keys of `inputs` (or a phase's inputs) whose value must not reach `results.json` or the
 report: the trail (typed text, labels, urls — including labels appended later by the repeat
 and certified guards), the persisted request/response urls, the findings, the expectation
-results (their `assertion` too), the `intent`, the certified-inputs list and the reason show
-`«key»` instead — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
+results (their `assertion` too), the `intent` (a REFUSED run's included), the certified-inputs
+list and the reason show `«key»` instead — longest value first, so a value that prefixes a
+longer one cannot expose its tail — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
 run's own outputs, for a password set during the run.
@@ -560,6 +564,12 @@ second scenario proves a check reporting `ok: false` FAILs the run naming the ph
 an `absentText` assertion quoting the secret come out masked; and a tall page whose
 submit button sits below the fold is completed by the BLOCKED auto-scroll (the fake
 `decide` answers BLOCKED whenever the button is not in the snapshot).
+Round-3 additions: `maskSecrets` longest-first, `flattenInputs` name collisions,
+phase names exempt from `{{run}}`, `~` in form encoding; in the browser files: a
+sibling iframe laid over the target frame is refused, a REFUSED run masks its
+intent, a phase's `response` assertion cannot ride on an earlier phase's response,
+an ineffective BLOCKED scroll stops after one attempt, a field holding another
+input is not overwritten when Jev offered an empty alternative.
 `test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
 page embedding an `<iframe>`: the framed input and button are offered with
 page coordinates and `frame: 1`, typing/clicking by those coordinates lands

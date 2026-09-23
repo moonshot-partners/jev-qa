@@ -139,8 +139,20 @@ async function point(page: Page, node: number, frameIndex?: number): Promise<{ x
   const x = p.x + box.x;
   const y = p.y + box.y;
   if (p.x < 0 || p.y < 0 || p.x > box.w || p.y > box.h) throw new Error('target outside its frame');
-  const parentHit = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.tagName ?? null, [x, y]);
-  if (parentHit !== 'IFRAME' && parentHit !== 'FRAME') throw new Error('target occluded (frame covered)');
+  // The element under the page point in the PARENT document must be this frame's own <iframe>:
+  // a sibling frame laid over it, or any other element, would receive the click instead. The
+  // point is translated into the parent's viewport for nested frames.
+  const parent = frame.parentFrame();
+  const parentBox = parent ? await frameBox(parent) : null;
+  const el = await frame.frameElement().catch(() => null);
+  if (!parent || !parentBox || !el) throw new Error('target frame not visible');
+  let own: boolean;
+  try {
+    own = await el.evaluate((e, [px, py]) => document.elementFromPoint(px, py) === e, [x - parentBox.x, y - parentBox.y] as [number, number]);
+  } finally {
+    await el.dispose().catch(() => {});
+  }
+  if (!own) throw new Error('target occluded (frame covered)');
   return { x, y };
 }
 

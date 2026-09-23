@@ -38,6 +38,22 @@ test('buildBody: redacts raw, URL-encoded, and HTML-escaped occurrences everywhe
   assert.ok(json.includes('script'), 'the key "script" should still be present');
 });
 
+test('buildBody: text_value criteria say which inputs were already typed and where, from the FULL history (beyond the 10-entry window)', () => {
+  const inputs = { first: 'Jev', email: 'a@b.test', zip: 'E1 6AN' };
+  const history: HistoryEntry[] = [
+    { action: 'First name', kind: 'fill', text: 'Jev', page_changed: false },
+    ...Array.from({ length: 12 }, (_, i) => ({ action: `Click ${i}`, kind: 'click', page_changed: false })),
+    { action: 'Email', kind: 'fill', text: 'a@b.test', page_changed: false },
+  ];
+  const obs: Observation = { ...baseObs(), actions: [{ id: 'e1', kind: 'fill', node: 1, role: 'textbox', label: 'ZIP', value: '' }] };
+  const { body } = buildBody(obs, 'fill the form', inputs, history);
+  const criteria = (body as { questions: { text_value: { criteria: Record<string, string> } } }).questions.text_value.criteria;
+  assert.match(criteria.first, /already typed into "First name"/, 'a fill older than the recent_actions window still counts');
+  assert.match(criteria.email, /already typed into "«email:1»"|already typed into "Email"/);
+  assert.doesNotMatch(criteria.zip, /already typed/);
+  assert.equal(JSON.stringify(body).includes('a@b.test'), false, 'the label is scrubbed like every other surface');
+});
+
 // --- round 7 (M1): goal and history action labels were never redacted at all -----------------
 
 test('buildBody: redacts the goal wherever it appears (every instructions.goal)', () => {
@@ -73,6 +89,12 @@ test('redactionForms: the SQL injection string produces the exact real-world WAF
   // encodeURIComponent, then %20 replaced with + — a real GET form's own encoding.
   assert.ok(forms.includes('%27+OR+1%3D1%3B+--+%22'), `expected the form-encoded variant, got ${JSON.stringify(forms)}`);
   assert.ok(forms.includes(value), 'expected the raw value itself');
+});
+
+test('redactionForms: "~" is form-encoded as %7E (a browser form does; encodeURIComponent does not)', () => {
+  const forms = redactionForms('Pw~abc');
+  assert.ok(forms.includes('Pw%7Eabc'), `expected the %7E form in ${JSON.stringify(forms)}`);
+  assert.ok(forms.includes('Pw%7eabc'), 'lower-case hex too');
 });
 
 test('redactionForms: "<script>" produces named AND numeric (decimal + hex) HTML entity forms', () => {
