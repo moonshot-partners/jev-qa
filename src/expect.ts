@@ -30,7 +30,10 @@ export function isPureAssertion(a: ExpectAssertion): boolean {
 // action (a submit that shows "Processing…") may still be in flight when Jev answers DONE, and
 // its result is exactly what the expectations describe. Returns how long it waited.
 export async function settleExpectations(expect: ExpectAssertion[], state: ExpectState, timeoutMs: number, intervalMs = 500): Promise<number> {
-  const pure = expect.filter(isPureAssertion);
+  // Only the pure assertions BEFORE the first check: a later one may describe the state a check
+  // produces (a check that opens a link, then a `url`), which cannot come true until it ran.
+  const firstCheck = expect.findIndex((a) => !isPureAssertion(a));
+  const pure = (firstCheck < 0 ? expect : expect.slice(0, firstCheck)).filter(isPureAssertion);
   if (!pure.length) return 0;
   const started = Date.now();
   for (;;) {

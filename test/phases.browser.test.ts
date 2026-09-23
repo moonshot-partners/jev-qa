@@ -3,7 +3,7 @@
 // from a mailbox"), sets a password there, and asserts on the resulting page. A scripted fake
 // `decide` drives the real runner; no Jev, no LLM. Skipped when JEV_QA_NO_BROWSER is set.
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -135,6 +135,43 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     assert.ok(r.trail.some((t) => t.text === '«password»'), 'the trail shows the key in place of the typed secret');
     assert.equal(r.video, undefined, 'no recording is kept for a scenario with secret inputs');
     assert.equal(existsSync(join(dir, 'out', 'acceptance_phases-run1-final.png')), false, 'no final screenshot either');
+    assert.equal(readdirSync(join(dir, 'out', 'videos')).length, 0, 'no recording of ANY page of the context (a login page included) is left behind');
+  } finally {
+    server.close();
+  }
+});
+
+// An overlay covers Alpha for the first 1.2 s: the first fill is refused (occluded), the retry
+// of the SAME fill must execute — it is not a repeat to be redirected elsewhere.
+const OVERLAY_HTML = `<!doctype html><html><body>
+<form method="GET" action="/two-done"><input id="a" name="a" type="text" aria-label="Alpha"><input id="b" name="b" type="text" aria-label="Beta"><button type="submit">Go</button></form>
+<div id="ov" style="position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.01)"></div>
+<script>setTimeout(() => document.getElementById('ov').remove(), 600);</script>
+</body></html>`;
+
+test('a retry after a fill that never executed is not treated as a repeat', { skip: SKIP }, async () => {
+  const hits: string[] = [];
+  const server = createServer((req, res) => { const url = new URL(req.url ?? '/', 'http://127.0.0.1'); hits.push(url.pathname + url.search); res.writeHead(200, { 'content-type': 'text/html' }); res.end(url.pathname === '/two-done' ? '<!doctype html><html><body><p>Done two</p></body></html>' : OVERLAY_HTML); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-overlay-'));
+  try {
+    const retry = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (new URL(obs.url).pathname === '/two-done') return DONE;
+      const alpha = obs.actions.find((a) => a.label === 'Alpha' && a.kind === 'fill')!;
+      const beta = obs.actions.find((a) => a.label === 'Beta' && a.kind === 'fill')!;
+      // Retry the SAME fill right after each refusal (no wait in between): the previous history
+      // entry is the failed fill itself, exactly what the repeat guard compares against.
+      const ok = history.filter((h) => h.kind === 'fill' && !h.failed).length;
+      if (ok === 0) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.alpha, alternatives: [beta] };
+      return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+    };
+    const s: Scenario = { name: 'acceptance/overlay-retry', kind: 'acceptance', role: null, start: '/', goal: 'fill', inputs: { alpha: 'one' }, maxSteps: 12, expect: [{ url: 'a=one' }] };
+    const [r] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [s], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide: retry } });
+    assert.equal(r.verdict, 'PASS', r.reason);
+    assert.ok(r.trail.some((t) => t.label.includes('not executed')), 'the first fill was refused');
+    assert.ok(!r.trail.some((t) => t.label.includes('repeat guard')), 'the retry was not redirected');
+    assert.ok(hits.some((h) => new URLSearchParams(h.split('?')[1] ?? '').get('a') === 'one' && !new URLSearchParams(h.split('?')[1] ?? '').get('b')), `alpha went into Alpha, nothing into Beta; hits: ${hits.join(' ')}`);
   } finally {
     server.close();
   }

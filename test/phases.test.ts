@@ -30,6 +30,10 @@ test('settleExpectations: waits for the pure assertions to come true, never poll
   const gaveUp = await settleExpectations([{ text: 'never' }], state, 60, 10);
   assert.ok(gaveUp >= 60, 'returns at the deadline');
   assert.equal(await settleExpectations([{ check: { name: 'c' } }], state, 5_000, 10), 0, 'nothing pure → no wait');
+  reads = -100;
+  assert.equal(await settleExpectations([{ check: { name: 'c' } }, { text: 'never' }], state, 60, 10), 0, 'an assertion after a check is not polled: the check may be what produces it');
+  reads = -100;
+  assert.ok((await settleExpectations([{ text: 'never' }, { check: { name: 'c' } }], state, 60, 10)) >= 60, 'an assertion before the first check is');
 });
 
 test('newRunId: short, lowercase alphanumeric, unique across calls', () => {

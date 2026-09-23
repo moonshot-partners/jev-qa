@@ -186,7 +186,12 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   const pseudonyms = newPseudonyms();
   const role = s.role ? config.roles[s.role] : null;
   const baseUrl = role ? resolveBaseUrl(role, env) : env.baseUrl;
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, recordVideo: { dir: videosDir, size: { width: 640, height: 400 } } });
+  // A scenario with secret inputs records nothing at all: the context records EVERY page,
+  // the login page a role's login() types credentials into included, and an image cannot be masked.
+  const ctx = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    ...(s.secretInputs?.length ? {} : { recordVideo: { dir: videosDir, size: { width: 640, height: 400 } } }),
+  });
   let page: Page | undefined;
   let expectResults: ExpectResult[] | undefined;
   const allExpect: ExpectResult[] = [];
@@ -273,6 +278,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     let blockedRetries = 0;
     let blockedScrolls = 0;
     let lastBlockedScrollY = -1;
+    let consecutiveFailures = 0;
     // The most recent SUCCESSFUL fill, tracked independently of `history` — a BLOCKED settle
     // retry pushes its own 'wait' entry onto history, and the mid-loop auto-Enter guard below
     // used to look only at the immediately previous history entry, so fill -> BLOCKED retry ->
@@ -441,7 +447,8 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // opened, a search box whose results are below the fold). Take its next-best target for
       // the same operation, else scroll; the harness owns "never repeat a no-op".
       const prev = history[history.length - 1];
-      const same = prev && prev.kind === d.action.kind && prev.action === d.action.label && (prev.text ?? null) === d.text;
+      // A retry after an action that never executed (occluded, detached) is not a repeat.
+      const same = prev && !prev.failed && prev.kind === d.action.kind && prev.action === d.action.label && (prev.text ?? null) === d.text;
       if (same) {
         const scroll = obs.actions.find((a) => a.id === 'scroll_down');
         // No page change last time → the control is exhausted, reveal more page; a change (e.g. a
@@ -533,8 +540,18 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
           submissionEvents.push({ kind: 'fill', text: d.text, ok: false, step });
         }
         trail[trail.length - 1].label += ` (not executed: ${(e as Error).message})`;
+        // A target that cannot be reached at all (permanently occluded, detached) is its own
+        // stuck signal: a transient overlay clears within a few attempts, a permanent one never.
+        if (++consecutiveFailures >= 4) {
+          loopReason = `stuck: "${d.action.label.slice(0, 40)}" could not be executed 4 times`;
+          break;
+        }
+        // A short backoff: a toast, an animation or a closing overlay clears in well under a
+        // second, and a decision made against the same covered target would just fail again.
+        await page.waitForTimeout(400);
         continue;
       }
+      consecutiveFailures = 0;
       const after = await observe(page).catch(() => obs);
       const changed = JSON.stringify([after.url, after.text.length, after.actions.length]) !== before;
       history.push({ action: d.action.label, kind: d.action.kind, text: d.text, page_changed: changed });
@@ -553,7 +570,9 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // shows the same empty state; only identical repeats (rule below) and true no-ops count.
       const newText = d.action.kind === 'fill' && d.text !== null && !history.slice(0, -1).some((h) => h.kind === 'fill' && h.text === d.text);
       unchanged = changed || d.action.kind === 'wait' || newText ? 0 : unchanged + 1;
-      const last = history.slice(-4).map((h) => h.kind + h.action + (h.text ?? ''));
+      // Only EXECUTED actions count as repeats; attempts that never executed are the failure
+      // counter's business above (and a retry after one is not a repeat — see the repeat guard).
+      const last = history.filter((h) => !h.failed).slice(-4).map((h) => h.kind + h.action + (h.text ?? ''));
       if (last.length === 4 && new Set(last).size === 1) {
         loopReason = `stuck: repeated "${d.action.label.slice(0, 40)}" 4 times`;
         break;
@@ -740,14 +759,8 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   if (video) {
     try {
       const videoPath = await video.path();
-      if (s.secretInputs?.length) {
-        // A recording shows whatever the page showed, a typed password included; the JSON
-        // outputs are masked, a video cannot be. A scenario with secret inputs keeps none.
-        unlinkSync(videoPath);
-      } else {
-        videoName = `${s.name.replace(/\W+/g, '_')}-run${run}.webm`;
-        renameSync(videoPath, join(videosDir, videoName));
-      }
+      videoName = `${s.name.replace(/\W+/g, '_')}-run${run}.webm`;
+      renameSync(videoPath, join(videosDir, videoName));
     } catch (e) {
       cleanupErrors.push(`video: ${(e as Error).message}`);
     }

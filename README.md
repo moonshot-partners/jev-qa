@@ -299,7 +299,7 @@ Every harness lesson from the spike's `MORNING.md` survives extraction:
 7. Known-issue tagging: triaged findings stay in the report as `known:<id>` but never fail a run, whichever oracle raised them (console/response/crash-screen alike) — `src/oracles.ts:36` (`classify`), `src/oracles.ts:47` (`record`, shared by `watch`'s oracles and the runner's own crash checks).
 8. Own-origin 401/403 don't poison the console-error oracle: same-step `known:authz` tagging — `src/oracles.ts:73`.
 9. A crash-screen check runs every step, independent of Jev's reading of the page — `src/runner.ts:117` — **and once more after the loop ends, on the settled final page** (guard 22): the per-step check alone never looks at the page AFTER the LAST action.
-10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step, and only while a scroll actually moves the page — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
+10. Stuck detection (4 identical EXECUTED actions, or 4 actions with no page change, or 4 consecutive attempts that could not execute at all — a permanently occluded or detached target) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step, and only while a scroll actually moves the page — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
 11. A cookie/consent interstitial is app-specific, so it is a config hook (`beforeEach`), not a hard-coded selector — `src/config.ts:43`, `src/runner.ts:103`.
 12. Generated smoke scenarios (role × page) are config-supplied (`smoke()`), not a separate script, and validated exactly like any other scenario — `src/config.ts:44`, `src/scenario.ts:104`.
 13. End-of-run rescue `Enter`: narrow on purpose — only for `adversarial` scenarios, only when the trailing fill's text is literally one of `s.inputs`' values (never an incidental form field), and only within the last two executed steps — `src/runner.ts:228`. Decides whether to fire by ACTUAL certification (`needsRescue()`, `src/submission.ts`), not by "was there any event at or after this step" — that heuristic suppressed the rescue on evidence that doesn't certify (an inert click, an unrelated poll request), leaving a real hostile input unsubmitted. Never records a submit event if the press itself rejects (true for this rule and guard 4 alike).
@@ -411,8 +411,9 @@ context (login and cookies carry over):
   a `url` is a config bug and reports ERROR.
 - **Expectations settle.** The last action's effect may still be in flight when Jev answers
   DONE (a submit whose button reads "Processing…"): before the one real evaluation, the pure
-  assertions (`url`, `text`, `absentText`, `element`, `response`) get up to 20 s to come true.
-  A `check` runs app code and may act, so it is never polled. The trail notes a wait over 1.5 s
+  assertions (`url`, `text`, `absentText`, `element`, `response`) listed BEFORE the first
+  `check` get up to 20 s to come true. A `check` runs app code and may act (open a link), so it
+  is never polled, and an assertion after it may be describing what that check produces. The trail notes a wait over 1.5 s
   and a settle that timed out. This applies to the scenario's own `expect` as well as a phase's.
 - Each phase has its own `goal`, `maxSteps` (default 25), `expect`, and `inputs` (merged over the
   scenario's; the same key in a phase overrides). Jev's history restarts per phase; the oracle,
@@ -474,9 +475,9 @@ longer one cannot expose its tail, and always before any clipping, so a cut neve
 prefix of a secret behind — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
-run's own outputs, for a password set during the run. Such a scenario keeps **no video and
-no final screenshot**: an image shows whatever the page showed, a typed password included,
-and cannot be masked.
+run's own outputs, for a password set during the run. Such a scenario **records nothing**
+— no video of any page of its context (the login page included) and no final screenshot:
+an image shows whatever the page showed, a typed password included, and cannot be masked.
 
 **Not covered:** a value the run never typed — e.g. a one-time token inside the url a start
 check returned — is scrubbed from Jev requests by the generic `«token:N»` rule but persists
