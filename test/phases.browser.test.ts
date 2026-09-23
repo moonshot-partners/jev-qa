@@ -133,6 +133,7 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     assert.ok(r.requests.some((q) => q.url.includes('/b-set?') && q.url.includes('«password»')), 'the persisted request url carries the key in place of the value');
     assert.ok(json.includes(email), 'a plain input stays readable');
     assert.ok(r.trail.some((t) => t.text === '«password»'), 'the trail shows the key in place of the typed secret');
+    assert.equal(r.video, undefined, 'no recording is kept for a scenario with secret inputs');
   } finally {
     server.close();
   }
@@ -225,7 +226,7 @@ test('a field that already holds another scenario input is never overwritten: th
 });
 
 test('a REFUSED run masks a secret quoted in its intent; a phase response assertion sees only its own phase\'s traffic', { skip: SKIP }, async () => {
-  const { server, base } = await fixture();
+  const { server, base, seen } = await fixture();
   const dir = mkdtempSync(join(tmpdir(), 'jevqa-refused-'));
   try {
     const config: Config = { ...configFor(base, { link: async () => ({ ok: true, detail: '', url: '/b?token=abc' }) }), environments: { ro: { baseUrl: base, mutations: false }, rw: { baseUrl: base, mutations: true } } };
@@ -271,6 +272,19 @@ test('a REFUSED run masks a secret quoted in its intent; a phase response assert
     const [lk] = await runAll({ config: cfg2, dir, envName: 'rw', scenarios: [leak], concurrency: 1, repeat: 1, outDir: join(dir, 'out5'), deps: { decide: typeOnly } });
     assert.equal(lk.verdict, 'BLOCKED', lk.reason);
     assert.match(lk.reason, /inputs not submitted: needle/);
+
+    // A phase without a start continues on the page the previous phase left: the main phase lands
+    // on /a-search; the next phase asserts on that very page without any navigation.
+    const cont: Scenario = {
+      name: 'acceptance/continue-in-place', kind: 'acceptance', role: null, start: '/a', goal: 'register', inputs: { email: 'qa-{{run}}@example.test' },
+      expect: [{ url: '/a-search' }],
+      then: [{ name: 'same page', goal: 'read the confirmation', maxSteps: 1, expect: [{ url: '/a-search' }, { text: 'Registered:' }] }],
+    };
+    const before = seen.length;
+    const [cp] = await runAll({ config, dir, envName: 'rw', scenarios: [cont], concurrency: 1, repeat: 1, outDir: join(dir, 'out6'), deps: { decide } });
+    assert.equal(cp.verdict, 'PASS', cp.reason);
+    assert.equal(seen.slice(before).filter((u) => u.startsWith('/a') && !u.startsWith('/a-search')).length, 1, 'the page was loaded once: the second phase did not navigate');
+    assert.ok((cp.expectResults ?? []).some((e) => e.phase === 'same page' && e.ok));
 
     // A secret equal to the run id never leaks through `runId`.
     const viaRun: Scenario = { name: 'acceptance/run-secret', kind: 'acceptance', role: null, start: '/a', goal: 'g', inputs: { password: '{{run}}' }, expect: [{ url: '/a' }], secretInputs: ['password'] };

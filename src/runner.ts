@@ -101,7 +101,7 @@ export function maskDeep(value: unknown, mask: (s: string) => string): unknown {
   if (typeof value === 'string') return mask(value);
   if (Array.isArray(value)) return value.map((v) => maskDeep(v, mask));
   if (value && typeof value === 'object' && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskDeep(v, mask)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [mask(k), maskDeep(v, mask)])); // keys too
   }
   return value;
 }
@@ -232,8 +232,10 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // returns one (e.g. the set-password link read from a mailbox). A check that reports
       // `ok: false` is a failed expectation of this phase (FAIL, named); one that reports ok
       // without a url is a config bug (ERROR).
-      let startUrl: string;
-      if (typeof phase.start === 'string') {
+      let startUrl: string | undefined;
+      if (phase.start === undefined) {
+        startUrl = undefined; // continue on the page as the previous phase left it
+      } else if (typeof phase.start === 'string') {
         startUrl = phase.start;
       } else {
         const { name, args } = phase.start.check;
@@ -249,14 +251,16 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         if (!r.url) throw new Error(`phase "${phase.name}": start check "${name}" reported ok but returned no url`);
         startUrl = r.url;
       }
-      await page.goto(startUrl.startsWith('http') ? startUrl : baseUrl + startUrl, { waitUntil: 'domcontentloaded' });
-      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-      // The hook was written for the scenario's start page (a consent banner); on a later
-      // phase's page it may find nothing and throw — that is not the phase's failure.
-      try {
-        await config.beforeEach?.(page);
-      } catch (e) {
-        trail.push({ op: 'BEFORE_EACH', label: mask(`beforeEach failed on phase "${phase.name}" start: ${(e as Error).message.split('\n')[0]}`).slice(0, 120), text: null, conf: 1, ms: 0, url: mask(page.url()), phase: phase.name });
+      if (startUrl !== undefined) {
+        await page.goto(startUrl.startsWith('http') ? startUrl : baseUrl + startUrl, { waitUntil: 'domcontentloaded' });
+        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+        // The hook was written for the scenario's start page (a consent banner); on a later
+        // phase's page it may find nothing and throw — that is not the phase's failure.
+        try {
+          await config.beforeEach?.(page);
+        } catch (e) {
+          trail.push({ op: 'BEFORE_EACH', label: mask(`beforeEach failed on phase "${phase.name}" start: ${(e as Error).message.split('\n')[0]}`).slice(0, 120), text: null, conf: 1, ms: 0, url: mask(page.url()), phase: phase.name });
+        }
       }
       history.length = 0;
       jevDone = false;
@@ -720,8 +724,14 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   if (video) {
     try {
       const videoPath = await video.path();
-      videoName = `${s.name.replace(/\W+/g, '_')}-run${run}.webm`;
-      renameSync(videoPath, join(videosDir, videoName));
+      if (s.secretInputs?.length) {
+        // A recording shows whatever the page showed, a typed password included; the JSON
+        // outputs are masked, a video cannot be. A scenario with secret inputs keeps none.
+        unlinkSync(videoPath);
+      } else {
+        videoName = `${s.name.replace(/\W+/g, '_')}-run${run}.webm`;
+        renameSync(videoPath, join(videosDir, videoName));
+      }
     } catch (e) {
       cleanupErrors.push(`video: ${(e as Error).message}`);
     }

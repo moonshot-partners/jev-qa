@@ -14,6 +14,8 @@ export type ExpectAssertion =
 
 // Where a later phase starts: a path/URL, or a config check that RETURNS one (`{ url }` on its
 // result) — e.g. a check that reads a mailbox and returns the link in the message it found.
+// Absent: the phase continues on the page exactly as the previous phase left it (a multi-step
+// form whose next step is already showing), with a fresh goal, inputs and expectations.
 export type PhaseStart = string | { check: { name: string; args?: unknown } };
 
 // A phase after the main one: same page/context (cookies, login carry over), a new start, goal,
@@ -21,7 +23,7 @@ export type PhaseStart = string | { check: { name: string; args?: unknown } };
 // expectation met; a phase's own inputs add to (and can override) the scenario's.
 export type Phase = {
   name?: string;
-  start: PhaseStart;
+  start?: PhaseStart;
   goal: string;
   inputs?: Record<string, string>;
   inputFields?: Record<string, string>;
@@ -148,6 +150,9 @@ function validateInputs(file: string, scenarioName: string, inputs: unknown, whe
   if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputs must be an object of string values`);
 }
 
+// `inputs` here is the scope's MERGED inputs (the scenario's plus the phase's own): a phase may
+// hint an input it inherits (the sign-up email typed again on the login page) without
+// redeclaring it.
 function validateInputFields(file: string, scenarioName: string, fields: unknown, inputs: unknown, where: string): void {
   const ok = fields && typeof fields === 'object' && !Array.isArray(fields) && Object.values(fields as object).every((v) => typeof v === 'string' && v.length > 0);
   if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputFields must be an object of non-empty strings (a label substring or /regex/ per input key)`);
@@ -172,7 +177,7 @@ export function hintedTarget<A extends { kind: string; label: string }>(hint: st
   return actions.find((a) => a.kind === 'fill' && test(a.label.split(' → ')[0]));
 }
 
-function validatePhases(file: string, scenarioName: string, then: unknown, config: Config): asserts then is Phase[] {
+function validatePhases(file: string, scenarioName: string, then: unknown, config: Config, scenarioInputs: Record<string, string> = {}): asserts then is Phase[] {
   if (!Array.isArray(then)) throw new Error(`${file}: scenario "${scenarioName}".then must be an array of phases`);
   then.forEach((p, i) => {
     const where = `.then[${i}]`;
@@ -183,22 +188,24 @@ function validatePhases(file: string, scenarioName: string, then: unknown, confi
     }
     const start = ph.start as unknown;
     const check = start && typeof start === 'object' && !Array.isArray(start) ? (start as { check?: unknown }).check : undefined;
-    if (typeof start === 'string') {
-      if (start.length === 0) throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }`);
+    if (start === undefined) {
+      // continue in place
+    } else if (typeof start === 'string') {
+      if (start.length === 0) throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }, or absent to continue on the current page`);
     } else if (check && typeof check === 'object' && typeof (check as { name?: unknown }).name === 'string') {
       const name = (check as { name: string }).name;
       if (!config.checks?.[name]) {
         throw new Error(`${file}: scenario "${scenarioName}"${where}.start.check references unknown check "${name}" (not in config.checks)`);
       }
     } else {
-      throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }`);
+      throw new Error(`${file}: scenario "${scenarioName}"${where}.start must be a non-empty string or { check: { name, args? } }, or absent to continue on the current page`);
     }
     if (typeof ph.goal !== 'string' || ph.goal.length === 0) {
       throw new Error(`${file}: scenario "${scenarioName}"${where} is missing the required string field "goal"`);
     }
     if (ph.expect !== undefined) validateExpect(file, `${scenarioName}${where}`, ph.expect);
     if (ph.inputs !== undefined) validateInputs(file, scenarioName, ph.inputs, where);
-    if (ph.inputFields !== undefined) validateInputFields(file, scenarioName, ph.inputFields, ph.inputs, where);
+    if (ph.inputFields !== undefined) validateInputFields(file, scenarioName, ph.inputFields, { ...scenarioInputs, ...((ph.inputs as Record<string, string> | undefined) ?? {}) }, where);
     if (ph.maxSteps !== undefined && typeof ph.maxSteps !== 'number') {
       throw new Error(`${file}: scenario "${scenarioName}"${where}.maxSteps must be a number when present`);
     }
@@ -226,7 +233,7 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
   if (sc.expect !== undefined) validateExpect(file, sc.name, sc.expect);
   if (sc.inputs !== undefined) validateInputs(file, sc.name, sc.inputs, '');
   if (sc.inputFields !== undefined) validateInputFields(file, sc.name, sc.inputFields, sc.inputs, '');
-  if (sc.then !== undefined) validatePhases(file, sc.name, sc.then, config);
+  if (sc.then !== undefined) validatePhases(file, sc.name, sc.then, config, (sc.inputs as Record<string, string> | undefined) ?? {});
   if (sc.secretInputs !== undefined) {
     const known = new Set([
       ...Object.keys((sc.inputs as object) ?? {}),

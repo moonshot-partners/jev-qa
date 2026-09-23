@@ -89,6 +89,7 @@ test('maskDeep: masks every string inside plain JSON data, leaves non-plain obje
   assert.equal(out.text, 'pw «password»');
   assert.deepEqual(out.list, ['«password»', 1, { deep: 'x «password» y' }]);
   assert.equal(out.when, when);
+  assert.deepEqual(maskDeep({ equals: { hunter2: 1 } }, mask), { equals: { '«password»': 1 } }, 'object keys are masked too');
 });
 
 test('loadScenarios: an acceptance scenario may carry its only expectation on a phase', () => {
@@ -138,6 +139,9 @@ test('loadScenarios: inputFields must name existing inputs, on the scenario and 
   assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { zip: '1' }, inputFields: { nope: 'ZIP' }, expect: [{ text: 'a' }] }, config), /inputFields names "nope"/);
   assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { zip: '1' }, inputFields: { zip: '' }, expect: [{ text: 'a' }] }, config), /inputFields must be an object of non-empty strings/);
   assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', expect: [{ text: 'a' }], then: [{ start: '/b', goal: 'h', inputFields: { pw: 'x' } }] }, config), /then\[0\]\.inputFields names "pw"/);
+  // A phase may hint an input it INHERITS from the scenario without redeclaring it.
+  const [inh] = load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { email: 'e' }, expect: [{ text: 'a' }], then: [{ start: '/login', goal: 'h', inputFields: { email: '/^Email address/i' } }] }, config);
+  assert.deepEqual(inh.then![0].inputFields, { email: '/^Email address/i' });
 });
 
 test('loadScenarios: an adversarial scenario may carry its hostile inputs on a phase only', () => {
@@ -190,6 +194,12 @@ test('loadScenarios: accepts a valid `then` phase with a check start and secretI
   );
   assert.equal(s.then!.length, 1);
   assert.deepEqual(s.secretInputs, ['password']);
+});
+
+test('loadScenarios: a phase without a start continues in place; an empty start string is rejected', () => {
+  const [s] = load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', expect: [{ text: 'a' }], then: [{ goal: 'continue here', expect: [{ text: 'b' }] }] }, configWith({}));
+  assert.equal(s.then![0].start, undefined);
+  assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', expect: [{ text: 'a' }], then: [{ start: '', goal: 'h' }] }, configWith({})), /or absent to continue on the current page/);
 });
 
 test('loadScenarios: rejects a phase whose check start is not in config.checks', () => {

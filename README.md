@@ -400,7 +400,11 @@ context (login and cookies carry over):
   own start navigation (or start check) on; an earlier phase's traffic never satisfies a later
   phase's assertion. `beforeEach` runs again on each phase's start page; if it throws there
   (a consent banner that is not on that page) the phase goes on and the trail notes it.
-- `start` is a path/URL, or `{ check: { name, args? } }`: the config check runs on the current
+- `start` is a path/URL, or `{ check: { name, args? } }`, or **absent** — the phase then continues
+  on the page exactly as the previous phase left it (a multi-step form whose next step is
+  already showing), with its own goal, inputs and expectations; keep each phase's goal to what
+  is on screen in that phase — a goal that describes controls no longer on the page makes Jev
+  answer BLOCKED. With a path or check, the config check runs on the current
   page (it may read a mailbox, an API, a database) and returns `{ ok, detail, url }`; the phase
   begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run
   as a named expectation of that phase (`phase "set password" expect #0 check: …`); `ok` without
@@ -442,7 +446,9 @@ field it belongs in, by label — a case-insensitive substring or a `/regex/`:
 Jev still decides *when* to type and *which* input; the engine then types it into the offered
 fill target whose label matches (frame-hosted controls included), whatever target Jev named,
 and notes `→ inputFields: <label>` in the trail. A hint that matches nothing on the current
-page falls back to Jev's own target. Every key must be one of that scope's inputs.
+page falls back to Jev's own target. Every key must be one of that scope's inputs — for a
+phase, its own or one inherited from the scenario (the sign-up email hinted again on the login
+page needs no redeclaration).
 
 ### `{{run}}` — a value unique to each run
 
@@ -463,7 +469,8 @@ longer one cannot expose its tail, and always before any clipping, so a cut neve
 prefix of a secret behind — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
-run's own outputs, for a password set during the run.
+run's own outputs, for a password set during the run. Such a scenario keeps **no video**:
+a recording shows whatever the page showed, a typed password included, and cannot be masked.
 
 **Not covered:** a value the run never typed — e.g. a one-time token inside the url a start
 check returned — is scrubbed from Jev requests by the generic `«token:N»` rule but persists
