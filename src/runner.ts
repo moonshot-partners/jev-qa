@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { act, focusAndVerify, observe } from './browser.ts';
 import { resolveBaseUrl, type Config } from './config.ts';
-import { evaluate, type ExpectResult } from './expect.ts';
+import { evaluate, settleExpectations, type ExpectResult, type ExpectState } from './expect.ts';
 import { decide as realDecide, newPseudonyms, redactValue, type Action, type Decision, type HistoryEntry, type Observation } from './jev.ts';
 import { DEFAULT_CRASH_TEXT, drainPending, newSink, record, watch, type Finding, type RequestRecord, type ResponseRecord } from './oracles.ts';
 import { renderReport } from './report.ts';
@@ -62,6 +62,9 @@ function emptyResult(s: Scenario, kind: Result['kind'], run: number, verdict: Ve
     intent: s.intent === undefined ? undefined : maskSecrets(s.intent, s),
   };
 }
+
+// How long the pure expectations of a phase may take to come true after its last action.
+const EXPECT_SETTLE_MS = 20_000;
 
 // PURE: replaces every occurrence of a `secretInputs` value with its «key» — applied to the
 // run's own outputs (trail text, certified list, reason). Jev requests never carried the value
@@ -628,7 +631,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
 
     let phaseFailed = false;
     if (phase.expect?.length) {
-      const results = await evaluate(phase.expect, {
+      const expectState: ExpectState = {
         // Round 7 (M4): read lazily, at the moment each assertion actually runs — a `check`
         // assertion earlier in the SAME list can navigate the page, and a `url`/`text` assertion
         // later in the list must see the page AS IT IS THEN, not a snapshot captured before any
@@ -649,7 +652,15 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
           await drainPending(sink, 5, 3_000);
           return result;
         },
-      });
+      };
+      // The last action's effect may still be in flight when Jev answers DONE (a submit showing
+      // "Processing…"): give the pure assertions up to EXPECT_SETTLE_MS to come true before the
+      // one real evaluation — checks (which may act) are never polled.
+      const settledIn = await settleExpectations(phase.expect, expectState, EXPECT_SETTLE_MS);
+      if (settledIn >= EXPECT_SETTLE_MS) trail[trail.length - 1].label += ` (expectations not settled after ${Math.round(EXPECT_SETTLE_MS / 1000)}s)`;
+      else if (settledIn > 1_500) trail[trail.length - 1].label += ` (expectations settled after ${(settledIn / 1000).toFixed(1)}s)`;
+      await drainPending(sink, 5, 3_000);
+      const results = await evaluate(phase.expect, expectState);
       // A `check` assertion can navigate to a crash screen; catch it now, not just before.
       await checkFinalCrash();
       for (const r of results) allExpect.push(phaseLabel ? { ...r, phase: phaseLabel } : r);

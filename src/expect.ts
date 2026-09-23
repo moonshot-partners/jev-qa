@@ -20,6 +20,27 @@ export type ExpectState = {
 
 export type ExpectResult = { assertion: ExpectAssertion; ok: boolean; expected: string; actual: string; phase?: string };
 
+// PURE (no side effects): the assertions that only READ page/network state — safe to evaluate
+// repeatedly. A `check` runs app code and may act (create a mailbox), so it is never polled.
+export function isPureAssertion(a: ExpectAssertion): boolean {
+  return 'url' in a || 'text' in a || 'absentText' in a || 'element' in a || 'response' in a;
+}
+
+// Waits until every pure assertion in the list holds, or the deadline passes — the page's last
+// action (a submit that shows "Processing…") may still be in flight when Jev answers DONE, and
+// its result is exactly what the expectations describe. Returns how long it waited.
+export async function settleExpectations(expect: ExpectAssertion[], state: ExpectState, timeoutMs: number, intervalMs = 500): Promise<number> {
+  const pure = expect.filter(isPureAssertion);
+  if (!pure.length) return 0;
+  const started = Date.now();
+  for (;;) {
+    const results = await Promise.all(pure.map((a) => evalOne(a, state)));
+    if (results.every((r) => r.ok)) return Date.now() - started;
+    if (Date.now() - started >= timeoutMs) return Date.now() - started;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 function parseMaybeRegex(s: string): RegExp | null {
   const m = /^\/(.*)\/([a-z]*)$/.exec(s);
   if (!m) return null;

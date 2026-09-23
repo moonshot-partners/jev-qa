@@ -409,6 +409,11 @@ context (login and cookies carry over):
   begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run
   as a named expectation of that phase (`phase "set password" expect #0 check: …`); `ok` without
   a `url` is a config bug and reports ERROR.
+- **Expectations settle.** The last action's effect may still be in flight when Jev answers
+  DONE (a submit whose button reads "Processing…"): before the one real evaluation, the pure
+  assertions (`url`, `text`, `absentText`, `element`, `response`) get up to 20 s to come true.
+  A `check` runs app code and may act, so it is never polled. The trail notes a wait over 1.5 s
+  and a settle that timed out. This applies to the scenario's own `expect` as well as a phase's.
 - Each phase has its own `goal`, `maxSteps` (default 25), `expect`, and `inputs` (merged over the
   scenario's; the same key in a phase overrides). Jev's history restarts per phase; the oracle,
   the trail and the step counter continue. The next phase runs only when the previous one

@@ -9,6 +9,28 @@ import type { Config } from '../src/config.ts';
 import { flattenInputs, maskDeep, maskSecrets } from '../src/runner.ts';
 import { applyRunId, hintedTarget, loadScenarios, newRunId, RUN_PLACEHOLDER, scenarioInputs, scenarioPhases, type Scenario } from '../src/scenario.ts';
 import { decideVerdict } from '../src/verdict.ts';
+import { isPureAssertion, settleExpectations, type ExpectState } from '../src/expect.ts';
+
+test('settleExpectations: waits for the pure assertions to come true, never polls a check, gives up at the deadline', async () => {
+  assert.equal(isPureAssertion({ check: { name: 'x' } }), false);
+  assert.equal(isPureAssertion({ text: 'x' }), true);
+  let reads = 0;
+  let checks = 0;
+  const state: ExpectState = {
+    url: () => 'http://x/',
+    bodyText: async () => (++reads >= 3 ? 'Payment Details' : 'Processing...'),
+    responses: [],
+    isElementVisible: async () => false,
+    runCheck: async () => { checks++; return { ok: true, detail: '' }; },
+  };
+  const waited = await settleExpectations([{ text: 'Payment Details' }, { check: { name: 'c' } }], state, 5_000, 10);
+  assert.ok(reads >= 3 && waited < 5_000, `settled after ${reads} reads in ${waited}ms`);
+  assert.equal(checks, 0, 'checks are never polled');
+  reads = -100;
+  const gaveUp = await settleExpectations([{ text: 'never' }], state, 60, 10);
+  assert.ok(gaveUp >= 60, 'returns at the deadline');
+  assert.equal(await settleExpectations([{ check: { name: 'c' } }], state, 5_000, 10), 0, 'nothing pure → no wait');
+});
 
 test('newRunId: short, lowercase alphanumeric, unique across calls', () => {
   const ids = new Set(Array.from({ length: 200 }, () => newRunId()));

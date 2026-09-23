@@ -317,6 +317,30 @@ test('BLOCKED auto-scroll stops as soon as a scroll moves nothing, leaving the s
   }
 });
 
+const SLOW_HTML = `<!doctype html><html><body>
+<button id="go" type="button">Go</button><div id="status"></div>
+<script>document.getElementById('go').addEventListener('click', () => { document.getElementById('status').textContent = 'Processing...'; setTimeout(() => { document.getElementById('status').textContent = 'Payment Details'; }, 2500); });</script>
+</body></html>`;
+
+test('expectations settle: a phase whose last action shows its result late still passes (Jev said DONE on "Processing…")', { skip: SKIP }, async () => {
+  const server = createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(SLOW_HTML); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-slow-'));
+  try {
+    const clickThenDone = async (obs: Observation, _goal: string, _inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (history.length) return DONE;
+      return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+    };
+    const s: Scenario = { name: 'acceptance/slow', kind: 'acceptance', role: null, start: '/', goal: 'go', maxSteps: 3, expect: [{ text: 'Payment Details' }, { absentText: 'Processing' }] };
+    const [r] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [s], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide: clickThenDone } });
+    assert.equal(r.verdict, 'PASS', r.reason);
+    assert.ok(r.trail.some((t) => /expectations settled after/.test(t.label)), 'the trail notes the wait');
+  } finally {
+    server.close();
+  }
+});
+
 const TALL_HTML = `<!doctype html><html><body>
 <form method="GET" action="/tall-done"><input id="q" name="q" type="text" aria-label="Email"><div style="height:1600px"></div><button type="submit">Go</button></form>
 </body></html>`;
