@@ -86,9 +86,11 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     });
     const s: Scenario = {
       name: 'acceptance/phases', kind: 'acceptance', role: null, start: '/a', goal: 'register with the email',
+      // The intent and an assertion quote the secret: both must come out masked in the result.
+      intent: 'set the password Pw-{{run}}! and log in',
       inputs: { email: 'qa-{{run}}@example.test' },
       expect: [{ url: '/a-search' }, { text: 'Registered:' }],
-      then: [{ start: { check: { name: 'welcomeLink', args: { inbox: 'qa-{{run}}@example.test' } } }, goal: 'set the password', inputs: { password: 'Pw-{{run}}!' }, expect: [{ url: '/b-set' }, { text: 'Password accepted' }] }],
+      then: [{ start: { check: { name: 'welcomeLink', args: { inbox: 'qa-{{run}}@example.test' } } }, goal: 'set the password', inputs: { password: 'Pw-{{run}}!' }, expect: [{ url: '/b-set' }, { text: 'Password accepted' }, { absentText: 'Pw-{{run}}!' }] }],
       secretInputs: ['password'],
     };
     calls.length = 0;
@@ -113,7 +115,9 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     assert.ok(onA.secrets.includes(password), 'a later phase\'s input value is redacted as a secret while the main phase runs');
     assert.ok(seen.includes('/b?token=abc'), 'the second phase started at the url the check returned');
     const phaseResults = (r.expectResults ?? []).filter((e) => e.phase === 'then #1');
-    assert.equal(phaseResults.length, 2, 'both phase expectations were evaluated');
+    assert.equal(phaseResults.length, 3, 'all phase expectations were evaluated');
+    assert.equal(r.intent, 'set the password «password» and log in', 'the intent is masked');
+    assert.deepEqual(phaseResults[2].assertion, { absentText: '«password»' }, 'the assertion itself is masked');
     assert.ok(phaseResults.every((e) => e.ok));
     assert.equal((r.expectResults ?? []).filter((e) => !e.phase).length, 2, 'main expectations kept, untagged');
     assert.ok(r.trail.some((t) => t.phase === 'then #1'), 'trail entries of the second phase are tagged');
@@ -128,6 +132,37 @@ test('phases: the second phase starts at the url a check returns, its inputs and
     assert.ok(r.requests.some((q) => q.url.includes('/b-set?') && q.url.includes('«password»')), 'the persisted request url carries the key in place of the value');
     assert.ok(json.includes(email), 'a plain input stays readable');
     assert.ok(r.trail.some((t) => t.text === '«password»'), 'the trail shows the key in place of the typed secret');
+  } finally {
+    server.close();
+  }
+});
+
+const TALL_HTML = `<!doctype html><html><body>
+<form method="GET" action="/tall-done"><input id="q" name="q" type="text" aria-label="Email"><div style="height:1600px"></div><button type="submit">Go</button></form>
+</body></html>`;
+
+test('BLOCKED with more page below scrolls before giving up, so a control under the fold is reached', { skip: SKIP }, async () => {
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(url.pathname === '/tall-done' ? '<!doctype html><html><body><p>Done tall</p></body></html>' : TALL_HTML);
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = mkdtempSync(join(tmpdir(), 'jevqa-tall-'));
+  try {
+    const tallDecide = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (new URL(obs.url).pathname === '/tall-done') return DONE;
+      const go = obs.actions.find((a) => a.label === 'Go' && a.kind === 'click');
+      const email = obs.actions.find((a) => a.label === 'Email' && a.kind === 'fill');
+      if (email && !history.some((h) => h.kind === 'fill')) return { ...DONE, operation: 'TYPE_TEXT', action: email, text: inputs.email };
+      if (go) return { ...DONE, operation: 'CLICK', action: go };
+      return { ...DONE, operation: 'BLOCKED' }; // cannot see the button: it is below the fold
+    };
+    const s: Scenario = { name: 'acceptance/tall', kind: 'acceptance', role: null, start: '/tall', goal: 'submit', inputs: { email: 'a@b.test' }, maxSteps: 8, expect: [{ url: '/tall-done' }] };
+    const [r] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [s], concurrency: 1, repeat: 1, outDir: join(dir, 'out'), deps: { decide: tallDecide } });
+    assert.equal(r.verdict, 'PASS', r.reason);
+    assert.ok(r.trail.some((t) => t.label.includes('auto-scrolled')), 'the second BLOCKED chance scrolled instead of waiting');
   } finally {
     server.close();
   }

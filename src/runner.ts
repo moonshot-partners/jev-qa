@@ -73,6 +73,17 @@ export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 
   return out;
 }
 
+// PURE: applies a string mask to every string inside plain JSON-shaped data (an expectation's
+// own assertion can quote a secret input's value, e.g. `{ text: "Welcome <password>" }`).
+export function maskDeep(value: unknown, mask: (s: string) => string): unknown {
+  if (typeof value === 'string') return mask(value);
+  if (Array.isArray(value)) return value.map((v) => maskDeep(v, mask));
+  if (value && typeof value === 'object' && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskDeep(v, mask)]));
+  }
+  return value;
+}
+
 // PURE (round 10, Q3): keeps only the most recent `max` entries of an already-chronological
 // array (requests/responses are pushed in step order as the run proceeds), reporting how many
 // older ones were dropped — a long/chatty run's `results.json` would otherwise grow unbounded.
@@ -212,6 +223,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     }
     let unchanged = 0;
     let blockedRetries = 0;
+    let blockedScrolls = 0;
     // The most recent SUCCESSFUL fill, tracked independently of `history` — a BLOCKED settle
     // retry pushes its own 'wait' entry onto history, and the mid-loop auto-Enter guard below
     // used to look only at the immediately previous history entry, so fill -> BLOCKED retry ->
@@ -262,7 +274,18 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         break;
       }
       if (d.operation === 'BLOCKED' || !d.action) {
-        // Client-rendered pages often look empty for a moment; give BLOCKED two chances to settle.
+        // The snapshot offers only what is in the viewport, so the control Jev needs may simply
+        // not be on screen yet (a form's checkboxes and submit button under a long list of
+        // fields): while the page continues below the fold, SCROLL rather than give up — up to
+        // a few screens, each its own step. Only then do client-rendered pages get their two
+        // settle chances (they often look empty for a moment).
+        const scroll = obs.actions.find((a) => a.id === 'scroll_down');
+        if (scroll && blockedScrolls++ < 5) {
+          await act(page, scroll, null);
+          history.push({ action: 'Scroll down (auto: nothing to do above the fold)', kind: 'scroll', page_changed: null });
+          trail[trail.length - 1].label += ' (auto-scrolled: more page below)';
+          continue;
+        }
         if (blockedRetries++ < 2) {
           await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
           await page.waitForTimeout(1000);
@@ -285,7 +308,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
           // repeat guard's own next-best-target-or-scroll so the run still makes progress.
           const scroll = obs.actions.find((a) => a.id === 'scroll_down');
           const alt = d.alternatives[0] ?? scroll;
-          trail[trail.length - 1].label += ` → already certified, no-op${alt ? `: ${alt.label.slice(0, 40)}` : ''}`;
+          trail[trail.length - 1].label += mask(` → already certified, no-op${alt ? `: ${alt.label.slice(0, 40)}` : ''}`);
           if (alt) {
             d.action = alt;
             if (alt.kind !== 'fill') d.text = null;
@@ -334,7 +357,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         // menu opened) → Jev wants something on the revealed page, take its next-best target.
         const alt = prev.page_changed === false ? (scroll ?? d.alternatives[0]) : (d.alternatives[0] ?? scroll);
         if (alt) {
-          trail[trail.length - 1].label += ` → repeat guard: ${alt.label.slice(0, 40)}`;
+          trail[trail.length - 1].label += mask(` → repeat guard: ${alt.label.slice(0, 40)}`);
           d.action = alt;
           if (alt.kind !== 'fill') d.text = null;
         }
@@ -635,8 +658,8 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     requestsOmitted: timeline.requestsOmitted,
     responsesOmitted: timeline.responsesOmitted,
     video: videoName && `videos/${videoName}`,
-    intent: s.intent,
-    expectResults: expectResults?.map((r) => ({ ...r, expected: mask(r.expected), actual: mask(r.actual) })),
+    intent: s.intent === undefined ? undefined : mask(s.intent),
+    expectResults: expectResults?.map((r) => ({ ...r, assertion: maskDeep(r.assertion, mask) as ExpectResult['assertion'], expected: mask(r.expected), actual: mask(r.actual) })),
     submitted: [...submitted].map(mask), runId,
   };
 }

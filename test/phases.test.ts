@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.ts';
-import { maskSecrets } from '../src/runner.ts';
+import { maskDeep, maskSecrets } from '../src/runner.ts';
 import { applyRunId, loadScenarios, newRunId, RUN_PLACEHOLDER, scenarioInputs, scenarioPhases, type Scenario } from '../src/scenario.ts';
 import { decideVerdict } from '../src/verdict.ts';
 
@@ -80,6 +80,21 @@ test('maskSecrets: covers the encoded forms a request URL or an escaped page car
   assert.equal(maskSecrets(encodeURIComponent('Pw-b2 c'), s), '«password»');
   assert.equal(maskSecrets('first Pw-a1! then Pw-b2 c', s), 'first «password» then «password»', 'both values of the reused key');
   assert.equal(maskSecrets(JSON.stringify({ v: 'Pw-a1!' }), s), '{"v":"«password»"}');
+});
+
+test('maskDeep: masks every string inside plain JSON data, leaves non-plain objects alone', () => {
+  const mask = (t: string) => t.split('hunter2').join('«password»');
+  const when = new Date(0);
+  const out = maskDeep({ text: 'pw hunter2', list: ['hunter2', 1, { deep: 'x hunter2 y' }], when }, mask) as { text: string; list: unknown[]; when: Date };
+  assert.equal(out.text, 'pw «password»');
+  assert.deepEqual(out.list, ['«password»', 1, { deep: 'x «password» y' }]);
+  assert.equal(out.when, when);
+});
+
+test('loadScenarios: an acceptance scenario may carry its only expectation on a phase', () => {
+  const [s] = load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', then: [{ start: '/b', goal: 'h', expect: [{ url: '/done' }] }] }, configWith({}));
+  assert.equal(s.expect, undefined);
+  assert.throws(() => load({ name: 'acceptance/y', role: null, start: '/', goal: 'g', then: [{ start: '/b', goal: 'h' }] }, configWith({})), /no expect assertions/);
 });
 
 test('scenarioInputs: every key with every value it had across the scenario and its phases', () => {

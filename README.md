@@ -294,7 +294,7 @@ Every harness lesson from the spike's `MORNING.md` survives extraction:
 7. Known-issue tagging: triaged findings stay in the report as `known:<id>` but never fail a run, whichever oracle raised them (console/response/crash-screen alike) — `src/oracles.ts:36` (`classify`), `src/oracles.ts:47` (`record`, shared by `watch`'s oracles and the runner's own crash checks).
 8. Own-origin 401/403 don't poison the console-error oracle: same-step `known:authz` tagging — `src/oracles.ts:73`.
 9. A crash-screen check runs every step, independent of Jev's reading of the page — `src/runner.ts:117` — **and once more after the loop ends, on the settled final page** (guard 22): the per-step check alone never looks at the page AFTER the LAST action.
-10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`.
+10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
 11. A cookie/consent interstitial is app-specific, so it is a config hook (`beforeEach`), not a hard-coded selector — `src/config.ts:43`, `src/runner.ts:103`.
 12. Generated smoke scenarios (role × page) are config-supplied (`smoke()`), not a separate script, and validated exactly like any other scenario — `src/config.ts:44`, `src/scenario.ts:104`.
 13. End-of-run rescue `Enter`: narrow on purpose — only for `adversarial` scenarios, only when the trailing fill's text is literally one of `s.inputs`' values (never an incidental form field), and only within the last two executed steps — `src/runner.ts:228`. Decides whether to fire by ACTUAL certification (`needsRescue()`, `src/submission.ts`), not by "was there any event at or after this step" — that heuristic suppressed the rescue on evidence that doesn't certify (an inert click, an unrelated poll request), leaving a real hostile input unsubmitted. Never records a submit event if the press itself rejects (true for this rule and guard 4 alike).
@@ -407,8 +407,12 @@ context (login and cookies carry over):
 - **Redaction spans phases.** While one phase runs, the input values of every other phase are
   redacted from Jev requests as secrets (a page that echoes what an earlier phase typed).
 - A failed expectation — including a phase whose start check reported `ok: false` — is FAIL
-  for **every** kind, smoke and adversarial included (only acceptance is *required* to carry
-  expectations; any kind that has them is held to them).
+  for **every** kind, smoke and adversarial included. An acceptance scenario needs at least one
+  expectation on the scenario OR on a phase; any kind that has them is held to them.
+- **Adversarial rule across phases:** every distinct (key, value) declared anywhere in the
+  scenario must have reached the server at least once in the run. A value inherited by a later
+  phase and not typed again there is not a failure — the phase inherits the certification, not
+  the obligation.
 - Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
   the verdict is the scenario's as a whole.
 
@@ -423,9 +427,10 @@ different ids.
 ### `secretInputs`
 
 Keys of `inputs` (or a phase's inputs) whose value must not reach `results.json` or the
-report: the trail (typed text, labels, urls), the persisted request/response urls, the
-findings, the expectation results, the certified-inputs list and the reason show `«key»`
-instead — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
+report: the trail (typed text, labels, urls — including labels appended later by the repeat
+and certified guards), the persisted request/response urls, the findings, the expectation
+results (their `assertion` too), the `intent`, the certified-inputs list and the reason show
+`«key»` instead — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
 run's own outputs, for a password set during the run.
@@ -445,6 +450,8 @@ or have the check return a url whose token is already consumed by the time the r
   clipped with it. The repeat guard compares action labels, so two frames offering a control with the
   SAME label (two "Continue" buttons) can trip it; the replace guard keys on the exact control (node +
   frame) and is not affected.
+- Frames: an `<iframe>` under a CSS `transform` (scale/rotate) is not handled — frame-local coordinates
+  are added unscaled to the element's box, so a scaled frame's controls are missed.
 - A click is one `mouse.click` at page coordinates (down and up in one go). A page whose layout shifts ON
   MOUSEDOWN (a field blurs, a block expands, the button moves out from under the pointer — seen with a
   hosted payment element's "save my info" block) can swallow a slower, human-paced press that this fast
@@ -549,7 +556,10 @@ evaluated and tagged — the certified list carries `«password»`, the value ap
 nowhere in the result in any encoding (the GET form carried it as `%21`), and the
 later phase's password was already redacted as a secret while the main phase ran; a
 second scenario proves a check reporting `ok: false` FAILs the run naming the phase
-(for a smoke scenario too), and one returning no url reports ERROR.
+(for a smoke scenario too), and one returning no url reports ERROR; the `intent` and
+an `absentText` assertion quoting the secret come out masked; and a tall page whose
+submit button sits below the fold is completed by the BLOCKED auto-scroll (the fake
+`decide` answers BLOCKED whenever the button is not in the snapshot).
 `test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
 page embedding an `<iframe>`: the framed input and button are offered with
 page coordinates and `frame: 1`, typing/clicking by those coordinates lands
