@@ -41,6 +41,15 @@ export type Action = {
   expanded?: string;
   delta?: number;
   rect?: { x: number; y: number; w: number; h: number };
+  // Index into the frame table observe() built for this page: 0/undefined = the main document,
+  // n = the n-th child frame it snapshotted (an <iframe>, cross-origin or not). Geometry is
+  // already translated to main-frame (page) coordinates; `node` is an id in THAT frame's cache.
+  frame?: number;
+  // A password field: offered as fillable by name only. Its value is never read into the
+  // observation (always ''), and the text typed into it comes from a scenario input like any
+  // other fill — buildBody() redacts that value out of every request surface (see README
+  // "Secrets"); a scenario's `secretInputs` additionally keeps it out of results/reports.
+  secret?: boolean;
 };
 
 export type Observation = {
@@ -49,6 +58,8 @@ export type Observation = {
   text: string;
   actions: Action[];
   omitted_actions: number;
+  w?: number; // viewport size, as the snapshot saw it (used to clip frame-hosted targets)
+  h?: number;
 };
 
 export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null };
@@ -256,7 +267,7 @@ function stripUrlQuery(url: string): string {
 
 function actionSpace(actions: Action[]) {
   const elements: Record<string, unknown>[] = [];
-  const indices = new Map<number, string>();
+  const indices = new Map<string, string>();
   const targets: Record<string, Record<string, Action>> = {};
   const controls: Record<string, Action> = {};
   const ops: Record<string, string> = { click: 'CLICK', fill: 'TYPE_TEXT', select: 'SELECT' };
@@ -266,12 +277,16 @@ function actionSpace(actions: Action[]) {
       controls[a.id.toUpperCase()] = a;
       continue;
     }
-    let index = indices.get(a.node!);
+    // Node ids are per FRAME (each frame keeps its own snapshot cache, each starting at 1), so
+    // the same id can name two different elements once frames are merged in — key by both.
+    const nodeKey = `${a.frame ?? 0}:${a.node!}`;
+    let index = indices.get(nodeKey);
     if (!index) {
       index = String(elements.length + 1);
-      indices.set(a.node!, index);
+      indices.set(nodeKey, index);
       const el: Record<string, unknown> = { index, label: a.label.split(' → ')[0], role: a.role, operations: [] };
       for (const k of ['value', 'checked', 'selected', 'expanded'] as const) if (a[k] !== undefined) el[k] = a[k];
+      if (a.secret) el.secret = true; // a password field: fill it by name; its value is never shown
       if (a.kind === 'select') Object.assign(el, { value: a.current_value ?? '', options: [] });
       elements.push(el);
     }

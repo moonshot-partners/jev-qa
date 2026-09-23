@@ -152,7 +152,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
     // used to look only at the immediately previous history entry, so fill -> BLOCKED retry ->
     // replacement silently never submitted the earlier value. `autoSubmitted` stops the guard
     // firing twice for the same fill.
-    let lastFill: { label: string; text: string; step: number; changed: boolean; autoSubmitted: boolean; node: number } | null = null;
+    let lastFill: { label: string; text: string; step: number; changed: boolean; autoSubmitted: boolean; node: number; frame?: number } | null = null;
     // L2: input keys already certified as submitted (submission.ts), recomputed fresh from every
     // event seen so far — including own-origin requests the oracle has already recorded THIS
     // step, e.g. a debounced search request that landed while the loop was between decisions.
@@ -232,7 +232,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
           // before pressing Enter — a focus-stealing element between the fill and this press
           // would otherwise submit whatever silently has focus instead. Skip the press entirely
           // (record nothing) rather than risk submitting into the wrong control.
-          if (await focusAndVerify(page, d.action.node!, d.text)) {
+          if (await focusAndVerify(page, d.action.node!, d.text, d.action.frame)) {
             reportStep = attributionStep;
             try {
               await page.keyboard.press('Enter');
@@ -309,7 +309,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
         } else
         // N6 (round 8): confirm focus is still actually in `lastFill`'s own field before
         // pressing Enter into it — see the fallback guard above for why.
-        if (await focusAndVerify(page, lastFill.node, lastFill.text)) {
+        if (await focusAndVerify(page, lastFill.node, lastFill.text, lastFill.frame)) {
           const urlBeforeEnter = obs.url;
           reportStep = lastFill.step;
           let navigated = false;
@@ -355,7 +355,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
       history.push({ action: d.action.label, kind: d.action.kind, text: d.text, page_changed: changed });
       if (d.action.kind === 'fill' && d.text !== null) {
         submissionEvents.push({ kind: 'fill', text: d.text, ok: true, step });
-        lastFill = { label: d.action.label, text: d.text, step, changed, autoSubmitted: false, node: d.action.node! };
+        lastFill = { label: d.action.label, text: d.text, step, changed, autoSubmitted: false, node: d.action.node!, frame: d.action.frame };
       }
       // Round 8 (N4): certification is STRONG-only now (an own-origin request that demonstrably
       // carries the value) — a bare 'submit'/'clickAfterFill' event, with no request evidence of
@@ -402,7 +402,7 @@ async function runOne(browser: Browser, config: Config, envName: string, s: Scen
           ),
         ];
         // N6 (round 8): confirm focus is still actually in the field before pressing Enter.
-        if (needsRescue(eventsSoFar, lastFill.text) && (await focusAndVerify(page, lastFill.node, lastFill.text))) {
+        if (needsRescue(eventsSoFar, lastFill.text) && (await focusAndVerify(page, lastFill.node, lastFill.text, lastFill.frame))) {
           reportStep = lastFill.step;
           try {
             await page.keyboard.press('Enter');

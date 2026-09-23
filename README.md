@@ -43,8 +43,8 @@ the `scenarios` glob(s); see `src/scenario.ts` for the schema.
 | `src/config.ts` | `Config`/`Environment`/`Role` types, `loadConfig`, `resolveBaseUrl`, minimal glob |
 | `src/scenario.ts` | `Scenario` type, JSON loading + validation, kind inference |
 | `src/jev.ts` | `buildBody()` (pure, redacts every input value) + `decide()` (fetch, retry, edge-block ladder, validate) |
-| `src/browser.ts` | Playwright observe/act (snapshot-driven, coordinate input) |
-| `src/snapshot.js` | In-page DOM snapshot (MIT, `snapshot.LICENSE`) |
+| `src/browser.ts` | Playwright observe/act (snapshot-driven, coordinate input); merges every child frame's snapshot into the observation (`frame` index + page coordinates, two-sided hit test) |
+| `src/snapshot.js` | In-page DOM snapshot (MIT, `snapshot.LICENSE`); runs once per frame; password fields listed by name only, their value never read |
 | `src/oracles.ts` | `classify`/`record`/`watch`/`drainPending`: pageerror, console.error, 4xx/5xx, own-origin requests (`sink.requests`) and responses, `known:` tagging |
 | `src/expect.ts` | Pure `evaluate()` of `expect` assertions against a captured page state |
 | `src/submission.ts` | Pure `submittedInputs()`: STRONG-ONLY (round 8) — an own-origin request that demonstrably carries the value, in the fill's own window; `uninspectableRequest()` flags a plausible-but-unconfirmable candidate for a more specific BLOCKED reason |
@@ -238,6 +238,46 @@ Every redacted surface uses the *identical* `«key»` token (current_value,
 runner has already certified as submitted is pruned out of the request
 entirely, not just relabelled — see guard 27.
 
+**Password fields** are offered to Jev by name only (`secret: true`), never with a value —
+see "Password fields" under Frames. The value typed into one is a scenario input and is
+redacted from every request surface exactly like a hostile string. Since inputs are
+otherwise deliberately readable in `results.json`/`report.html`, a scenario lists such
+keys under `secretInputs`: the trail, the certified-inputs list and the reason then show
+`«key»` in place of the value. Jev still learns the value's LENGTH from the input
+descriptor (`N characters`), as for any input.
+
+### Frames
+
+Third-party payment fields, embedded editors and widgets live in `<iframe>`s, often
+cross-origin, where a top-document snapshot sees nothing. `observe()` runs the snapshot
+script in the main document AND in every child frame (`frame.evaluate`, which works across
+the origin boundary), so the engine never needs DOM access from the parent. A frame-hosted
+control is offered like any other, with:
+
+- `frame`: an index into the frame table `observe()` keeps per page (0/absent = the main
+  document). Node ids are per frame, so Jev's element list keys on `frame:node`.
+- geometry translated to page coordinates by the `<iframe>` element's own box (nested
+  frames included, via Playwright's main-frame-relative `boundingBox()`); a control whose
+  centre falls outside its iframe's box or the viewport is dropped, as the browser could
+  not deliver a click there.
+- the frame's visible text appended to the page text.
+
+Input is unchanged — click at page `x,y`, then type — so a cross-origin card field is
+filled exactly like a main-document one. The hit test before input is two-sided: inside
+the frame the point must land on the target; in the main document it must land on an
+`<iframe>` (a modal, sticky bar or popover laid over the frame refuses the input with
+`target occluded (frame covered)`). `focusAndVerify()` checks `document.activeElement`
+in the target's own frame.
+
+### Password fields
+
+`type=password` inputs are listed as fillable textboxes **by name only**, flagged
+`secret: true` for Jev. Their value is never read: the observation, the page key and the
+guard record only whether the field holds anything (`•`), never what. The text typed into
+one comes from a scenario input like any other fill, so `buildBody()`'s redaction keeps
+that value out of every request surface; list its key under the scenario's
+`secretInputs` to keep it out of `results.json` and the report too (see Secrets).
+
 ## Guards
 
 Every harness lesson from the spike's `MORNING.md` survives extraction:
@@ -326,6 +366,14 @@ Scenario fields: `name`, `kind` (`smoke` / `adversarial` / `acceptance`; inferre
 
 - Jev has no vision and no text generation. It picks one operation and one target from what the snapshot
   offers. Hostile strings live in scenario `inputs`; the engine substitutes them locally.
+- Frames: the parent-side hit test checks the MAIN document only (the point must land on an `<iframe>`);
+  an intermediate frame of a deeper nesting is not checked separately. A frame that refuses evaluation
+  (about:blank, mid-navigation) is skipped for that step. Frame text is appended after the main text and
+  clipped with it.
+- A click is one `mouse.click` at page coordinates (down and up in one go). A page whose layout shifts ON
+  MOUSEDOWN (a field blurs, a block expands, the button moves out from under the pointer — seen with a
+  hosted payment element's "save my info" block) can swallow a slower, human-paced press that this fast
+  click still wins; the engine does not re-hit-test between down and up.
 - Runs are non-deterministic. Repeat a scenario (`--repeat 3`) before treating a verdict as stable.
 - Certification compares the typed value with the decoded request value as sent. A value the app
   normalises before sending (case change, trimmed whitespace, collapsed spaces) is not certified; the
@@ -412,6 +460,14 @@ REPLACE guard's own debounce-grace poll (guard 46), not luck or an
 unrelated wait, is what lets a value certify without the runner ever
 forcing an Enter into the field; both values end up submitted and the
 trail carries no `auto-submitted previous value` entry.
+`test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
+page embedding an `<iframe>`: the framed input and button are offered with
+page coordinates and `frame: 1`, typing/clicking by those coordinates lands
+inside the frame, a main-document overlay over the iframe makes `act()`
+refuse (`occluded`) while the frame-side snapshot alone could never see it
+(mutation-checked), the same node id in two frames stays two Jev elements,
+and a password field is offered by name with its value never read before or
+after typing — while `buildBody()` never sends the input value.
 `test/replay.browser.test.ts` proves `replayUrls()` releases its browser
 even when `role.login()` throws. Set `JEV_QA_NO_BROWSER=1` to skip both
 browser files. `test/runner.test.ts` unit-tests `capRecent()` and
