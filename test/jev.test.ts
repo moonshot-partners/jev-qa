@@ -414,6 +414,29 @@ test('decide: a certified key never appears in the outgoing text_value.criteria 
   assert.ok('b' in sentCriteria);
 });
 
+test('decide: the action and alternatives handed back are the ORIGINAL observation entries (raw value), not the redacted request copies', async () => {
+  const inputs = { a: 'alpha', b: 'beta' };
+  const obs = baseObs({ actions: [
+    { id: 'e1', kind: 'fill', node: 1, role: 'textbox', label: 'q', value: 'alpha' },
+    { id: 'e2', kind: 'fill', node: 2, role: 'textbox', label: 'r', value: '' },
+  ] });
+  const answers = {
+    answers: {
+      operation: { choice: 'TYPE_TEXT', confidence: 1, probabilities: { TYPE_TEXT: 1, DONE: 0, BLOCKED: 0 } },
+      type_text_target: { choice: '1', confidence: 0.6, probabilities: { '1': 0.6, '2': 0.4 } },
+      text_value: { choice: 'b', confidence: 1, probabilities: { a: 0, b: 1 } },
+    },
+    usage: { input_tokens: 10 },
+  };
+  const res = new Response(JSON.stringify(answers), { status: 200, headers: { 'content-type': 'application/json' } });
+  const { fetch: fetchFn, bodies } = fakeFetchSequence([res]);
+  const d: Decision = await decide(obs, 'goal', inputs, [], new Set(), [], undefined, { fetch: fetchFn });
+  assert.equal(d.action, obs.actions[0], 'same object as the observation');
+  assert.equal(d.action!.value, 'alpha', 'raw value, so the runner can compare it with what it typed');
+  assert.equal(d.alternatives[0], obs.actions[1]);
+  assert.ok(bodies[0].includes('«a»') && !bodies[0].includes('alpha'), 'the request itself still carried the redacted copy');
+});
+
 test('buildBody: an empty-string input value is never redacted against (would corrupt everything)', () => {
   const inputs = { empty: '', real: 'hostile' };
   const obs = baseObs({ text: 'some ordinary page text with hostile in it' });

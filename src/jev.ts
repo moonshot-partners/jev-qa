@@ -316,6 +316,7 @@ export type BuiltRequest = {
   targets: Record<string, Record<string, Action>>;
   controls: Record<string, Action>;
   elements: Record<string, unknown>[];
+  originals: WeakMap<Action, Action>; // redacted copy → the observation's own entry
 };
 
 // PURE (no network): everything decide() sends to TypeSafe, and everything it
@@ -364,6 +365,13 @@ export function buildBody(
     expanded: a.expanded !== undefined ? redactField(a.expanded, valueClip) : undefined,
   }));
   const { elements, targets, controls } = actionSpace(redactedActions);
+  // Everything buildBody() returns stays REDACTED (the request, and the tables used to read the
+  // answer). The map back to the ORIGINAL observation entries is what decide() hands the runner:
+  // it compares an action's current `value` with the raw text it typed (the overwrite and
+  // already-holds guards), and a redacted «key» token can never equal a raw value — those guards
+  // were dead against a real Jev answer. A WeakMap serialises to {} and carries nothing itself.
+  const originals = new WeakMap<Action, Action>();
+  obs.actions.forEach((a, i) => originals.set(redactedActions[i], a));
 
   const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
 
@@ -461,7 +469,7 @@ export function buildBody(
     questions,
   };
 
-  return { body, operations, targets, controls, elements };
+  return { body, operations, targets, controls, elements, originals };
 }
 
 function isEdgeBlockBody(text: string): boolean {
@@ -539,7 +547,8 @@ export async function decide(
   const latencyMs = Math.round(performance.now() - started);
   const inputTokens = result.usage?.input_tokens ?? 0;
 
-  const { operations, targets, controls } = built!;
+  const { operations, targets, controls, originals } = built!;
+  const original = (a: Action) => originals.get(a) ?? a;
   const opAnswer = validate(result.answers.operation, Object.keys(operations));
   const operation = opAnswer.choice;
   let action: Action | null = null;
@@ -548,9 +557,9 @@ export async function decide(
   if (operation in targets) {
     const head = targets[operation];
     const t = validate(result.answers[`${operation.toLowerCase()}_target`], Object.keys(head));
-    action = head[t.choice];
+    action = original(head[t.choice]);
     for (const [k, p] of Object.entries(t.probabilities).sort((a, b) => b[1] - a[1])) {
-      if (k !== t.choice && p >= 0.05) alternatives.push(head[k]);
+      if (k !== t.choice && p >= 0.05) alternatives.push(original(head[k]));
     }
     if (operation === 'TYPE_TEXT') {
       // Jev chose a KEY (it never saw the value); substitute the real value back in locally.
@@ -559,7 +568,7 @@ export async function decide(
       text = inputs[validate(result.answers.text_value, remainingInputs).choice];
     }
   } else if (operation in controls) {
-    action = controls[operation];
+    action = original(controls[operation]);
   }
   return { operation, action, text, confidence: opAnswer.confidence, latencyMs, inputTokens, alternatives, degraded };
 }

@@ -238,6 +238,10 @@ Every redacted surface uses the *identical* `«key»` token (current_value,
 runner has already certified as submitted is pruned out of the request
 entirely, not just relabelled — see guard 27.
 
+`decide()` hands the runner the observation's ORIGINAL action entries (raw `value`), not the
+redacted copies the request carried: the guards that compare a field's value with what the run
+typed depend on it. `buildBody()`'s own return stays fully redacted.
+
 **Password fields** are offered to Jev by name only (`secret: true`), never with a value —
 see "Password fields" under Frames. The value typed into one is a scenario input and is
 redacted from every request surface exactly like a hostile string. Since inputs are
@@ -415,9 +419,11 @@ context (login and cookies carry over):
   for **every** kind, smoke and adversarial included. An acceptance scenario needs at least one
   expectation on the scenario OR on a phase; any kind that has them is held to them.
 - **Adversarial rule across phases:** every distinct (key, value) declared anywhere in the
-  scenario must have reached the server at least once in the run. A value inherited by a later
-  phase and not typed again there is not a failure — the phase inherits the certification, not
-  the obligation.
+  scenario must have reached the server at least once in the run — certified inside the window
+  of the phase that typed it (a later phase's start navigation carrying the value never
+  certifies an earlier phase's unsubmitted fill). A value inherited by a later phase and not
+  typed again there is not a failure — the phase inherits the certification, not the
+  obligation. An adversarial scenario may declare its hostile inputs on a phase only.
 - Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
   the verdict is the scenario's as a whole.
 
@@ -453,7 +459,8 @@ report: the trail (typed text, labels, urls — including labels appended later 
 and certified guards), the persisted request/response urls, the findings, the expectation
 results (their `assertion` too), the `intent` (a REFUSED run's included), the certified-inputs
 list and the reason show `«key»` instead — longest value first, so a value that prefixes a
-longer one cannot expose its tail — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
+longer one cannot expose its tail, and always before any clipping, so a cut never leaves a
+prefix of a secret behind — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
 a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
 phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
 run's own outputs, for a password set during the run.

@@ -33,6 +33,7 @@ async function fixture(): Promise<{ server: Server; base: string; seen: string[]
     seen.push(url.pathname + url.search);
     res.writeHead(200, { 'content-type': 'text/html' });
     if (url.pathname === '/a') res.end(A_HTML);
+    else if (url.pathname === '/noform') res.end('<!doctype html><html><body><input id="q" type="text" aria-label="Email"></body></html>');
     else if (url.pathname === '/a-search') {
       registered = url.searchParams.get('q') ?? '';
       res.end(A_SEARCH_HTML(registered));
@@ -255,6 +256,21 @@ test('a REFUSED run masks a secret quoted in its intent; a phase response assert
     };
     const [st] = await runAll({ config, dir, envName: 'rw', scenarios: [starts], concurrency: 1, repeat: 1, outDir: join(dir, 'out3'), deps: { decide } });
     assert.equal(st.verdict, 'PASS', st.reason);
+
+    // A later phase's start request can never certify an earlier phase's unsubmitted fill: phase A
+    // types `needle` and never submits; phase B starts at a url carrying it. Adversarial → BLOCKED.
+    // /noform has a bare input: the end-of-run rescue Enter submits nothing there, so the ONLY
+    // request that could ever carry `needle` is the next phase's own start navigation.
+    const typeOnly = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      const email = obs.actions.find((a) => a.label === 'Email' && a.kind === 'fill');
+      if (email && !history.some((h) => h.kind === 'fill') && new URL(obs.url).pathname === '/noform') return { ...DONE, operation: 'TYPE_TEXT', action: email, text: inputs.needle };
+      return DONE;
+    };
+    const cfg2: Config = { ...config, checks: { carry: async (_ctx, args) => ({ ok: true, detail: '', url: `/b?token=${encodeURIComponent(String(args))}` }) } };
+    const leak: Scenario = { name: 'adversarial/phase-leak', kind: 'adversarial', role: null, start: '/noform', goal: 'type', inputs: { needle: 'needle-{{run}}' }, then: [{ start: { check: { name: 'carry', args: 'needle-{{run}}' } }, goal: 'nothing', maxSteps: 1 }] };
+    const [lk] = await runAll({ config: cfg2, dir, envName: 'rw', scenarios: [leak], concurrency: 1, repeat: 1, outDir: join(dir, 'out5'), deps: { decide: typeOnly } });
+    assert.equal(lk.verdict, 'BLOCKED', lk.reason);
+    assert.match(lk.reason, /inputs not submitted: needle/);
 
     // A secret equal to the run id never leaks through `runId`.
     const viaRun: Scenario = { name: 'acceptance/run-secret', kind: 'acceptance', role: null, start: '/a', goal: 'g', inputs: { password: '{{run}}' }, expect: [{ url: '/a' }], secretInputs: ['password'] };

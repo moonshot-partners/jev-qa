@@ -140,6 +140,12 @@ test('loadScenarios: inputFields must name existing inputs, on the scenario and 
   assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', expect: [{ text: 'a' }], then: [{ start: '/b', goal: 'h', inputFields: { pw: 'x' } }] }, config), /then\[0\]\.inputFields names "pw"/);
 });
 
+test('loadScenarios: an adversarial scenario may carry its hostile inputs on a phase only', () => {
+  const [s] = load({ name: 'adversarial/x', role: null, start: '/', goal: 'g', then: [{ start: '/form', goal: 'h', inputs: { sql: "' OR 1=1" } }] }, configWith({}));
+  assert.equal(s.kind, 'adversarial');
+  assert.throws(() => load({ name: 'adversarial/y', role: null, start: '/', goal: 'g', then: [{ start: '/form', goal: 'h' }] }, configWith({})), /has no inputs/);
+});
+
 test('scenarioInputs: every key with every value it had across the scenario and its phases', () => {
   const s: Pick<Scenario, 'inputs' | 'then'> = { inputs: { email: 'e', password: 'p1' }, then: [{ start: '/x', goal: 'g', inputs: { password: 'p2', pin: '1' } }, { start: '/y', goal: 'h', inputs: { password: 'p1' } }] };
   assert.deepEqual(scenarioInputs(s), { email: ['e'], password: ['p1', 'p2'], pin: ['1'] });

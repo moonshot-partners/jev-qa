@@ -187,6 +187,10 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   let page: Page | undefined;
   let expectResults: ExpectResult[] | undefined;
   const allExpect: ExpectResult[] = [];
+  // Each phase's evidence window [first step, last step]: the final certified set is the union
+  // of the phases' own windows, so a later phase's start request (or any traffic of its own)
+  // can never certify a fill an earlier phase made and never submitted.
+  const phaseRanges: [number, number][] = [];
   let findings: Finding[] = [];
   let responses: ResponseRecord[] = [];
   let requests: RequestRecord[] = [];
@@ -252,7 +256,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       try {
         await config.beforeEach?.(page);
       } catch (e) {
-        trail.push({ op: 'BEFORE_EACH', label: `beforeEach failed on phase "${phase.name}" start: ${(e as Error).message.split('\n')[0].slice(0, 80)}`, text: null, conf: 1, ms: 0, url: mask(page.url()), phase: phase.name });
+        trail.push({ op: 'BEFORE_EACH', label: mask(`beforeEach failed on phase "${phase.name}" start: ${(e as Error).message.split('\n')[0]}`).slice(0, 120), text: null, conf: 1, ms: 0, url: mask(page.url()), phase: phase.name });
       }
       history.length = 0;
       jevDone = false;
@@ -351,7 +355,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         const key = Object.entries(phaseInputs).find(([, v]) => v === d.text)?.[0];
         const hinted = key !== undefined ? hintedTarget(phaseFields[key], obs.actions) : undefined;
         if (hinted && hinted !== d.action && !(hinted.node === d.action.node && (hinted.frame ?? 0) === (d.action.frame ?? 0))) {
-          trail[trail.length - 1].label += mask(` → inputFields: ${hinted.label.slice(0, 40)}`);
+          trail[trail.length - 1].label += ` → inputFields: ${mask(hinted.label).slice(0, 40)}`;
           d.action = hinted;
         }
       }
@@ -361,7 +365,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         const holdsNothingOfOurs = (a: Action) => a.kind === 'fill' && (!holdsOurs(a) || a.value === d.text);
         const alt = d.alternatives.find(holdsNothingOfOurs);
         if (alt) {
-          trail[trail.length - 1].label += mask(` → holds another input, not overwritten: ${alt.label.slice(0, 40)}`);
+          trail[trail.length - 1].label += ` → holds another input, not overwritten: ${mask(alt.label).slice(0, 40)}`;
           d.action = alt;
         } else if (kind !== 'adversarial') {
           // No better target offered. An adversarial scenario feeds every input into the same
@@ -386,7 +390,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
           // repeat guard's own next-best-target-or-scroll so the run still makes progress.
           const scroll = obs.actions.find((a) => a.id === 'scroll_down');
           const alt = d.alternatives[0] ?? scroll;
-          trail[trail.length - 1].label += mask(` → already certified, no-op${alt ? `: ${alt.label.slice(0, 40)}` : ''}`);
+          trail[trail.length - 1].label += ` → already certified, no-op${alt ? `: ${mask(alt.label).slice(0, 40)}` : ''}`;
           if (alt) {
             d.action = alt;
             if (alt.kind !== 'fill') d.text = null;
@@ -435,7 +439,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         // menu opened) → Jev wants something on the revealed page, take its next-best target.
         const alt = prev.page_changed === false ? (scroll ?? d.alternatives[0]) : (d.alternatives[0] ?? scroll);
         if (alt) {
-          trail[trail.length - 1].label += mask(` → repeat guard: ${alt.label.slice(0, 40)}`);
+          trail[trail.length - 1].label += ` → repeat guard: ${mask(alt.label).slice(0, 40)}`;
           d.action = alt;
           if (alt.kind !== 'fill') d.text = null;
         }
@@ -609,7 +613,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     const checkFinalCrash = async () => {
       const finalObs = await observe(page!).catch(() => null);
       if (finalObs) {
-        finalText = finalObs.text.slice(0, 1_500);
+        finalText = mask(finalObs.text).slice(0, 1_500); // mask BEFORE clipping: a clip can cut a secret in two
         const finalCrash = crashText.find((re) => re.test(finalObs.text));
         if (finalCrash) record(sink, finalObs.url, lastExecutedStep, 'crash-screen', finalCrash.source, { noise: config.noise, known: config.known });
       }
@@ -647,6 +651,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       for (const r of results) allExpect.push(phaseLabel ? { ...r, phase: phaseLabel } : r);
       phaseFailed = results.some((r) => !r.ok);
     }
+    phaseRanges.push([phaseFirstStep, step]);
     if (phaseLabel && !jevDone) loopReason = `phase "${phase.name}": ${loopReason}`;
     // The next phase runs only on a clean hand-over: Jev DONE here, every expectation met.
     if (!jevDone || phaseFailed) break;
@@ -675,7 +680,9 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         (r): SubmissionEvent => ({ kind: 'request', step: r.step, method: r.method, url: r.url, postData: r.postData, bodyOversized: r.bodyOversized, contentType: r.contentType }),
       ),
     ];
-    submitted = submittedInputs(finalEvents);
+    submitted = new Set<string>();
+    const ranges = phaseRanges.length ? phaseRanges : [[0, Number.MAX_SAFE_INTEGER] as [number, number]];
+    for (const [from, to] of ranges) for (const v of submittedInputs(finalEvents.filter((e) => e.step >= from && e.step <= to))) submitted.add(v);
     // N4/N5b (round 8): for any adversarial input that never got fully certified, note when
     // there's a more specific reason than "nothing happened at all" — a PARTIAL prefix match
     // first (checked first: it's the more actionable, and the more likely, of the two — real

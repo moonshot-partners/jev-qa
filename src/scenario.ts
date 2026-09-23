@@ -251,8 +251,9 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
   if (kind === 'acceptance' && (!Array.isArray(sc.expect) || sc.expect.length === 0) && !phaseExpects) {
     throw new Error(`${file}: scenario "${sc.name}" has kind "acceptance" but no expect assertions (acceptance scenarios need at least one expect entry, on the scenario or on a phase, or they can never do more than reach Jev DONE unverified)`);
   }
-  if (kind === 'adversarial' && (!sc.inputs || typeof sc.inputs !== 'object' || Array.isArray(sc.inputs) || Object.keys(sc.inputs as object).length === 0)) {
-    throw new Error(`${file}: scenario "${sc.name}" has kind "adversarial" but has no inputs (adversarial scenarios need at least one hostile input to submit)`);
+  const phaseInputs = ((sc.then as Phase[] | undefined) ?? []).some((p) => p.inputs && Object.keys(p.inputs).length > 0);
+  if (kind === 'adversarial' && (!sc.inputs || typeof sc.inputs !== 'object' || Array.isArray(sc.inputs) || Object.keys(sc.inputs as object).length === 0) && !phaseInputs) {
+    throw new Error(`${file}: scenario "${sc.name}" has kind "adversarial" but has no inputs (adversarial scenarios need at least one hostile input to submit, on the scenario or on a phase)`);
   }
 }
 
