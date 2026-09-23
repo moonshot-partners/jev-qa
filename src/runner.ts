@@ -41,6 +41,9 @@ export type Result = {
   responsesOmitted?: number;
   requestsOmitted?: number;
   video?: string;
+  // What the settled final page SAID (visible text, clipped, masked): a failed run's reason
+  // names the assertion that missed, but the page's own error banner is what explains it.
+  finalText?: string;
   intent?: string;
   expectResults?: ExpectResult[];
   submitted: string[];
@@ -167,6 +170,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   let loopReason = 'step budget used up';
   let error: string | undefined;
   let unreadBodies = 0;
+  let finalText: string | undefined;
 
   // Round 8 (N2): extra secret strings the app config knows about (e.g. a logged-in role's own
   // creds), redacted the same as scenario inputs but to the shared «secret» token — resolved
@@ -209,7 +213,15 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     // email typed at sign-up shown on the next page): redact them like config secrets.
     const offered = new Set(Object.values(phaseInputs));
     const phaseSecrets = [...secrets, ...Object.values(allInputs).filter((v) => !offered.has(v))];
-    const phaseFirstStep = step + 1;
+    // The phase's evidence window opens at its own start navigation: step 0 for the main phase
+    // (its start page's responses count), a fresh step of its own for a later phase, so the
+    // previous phase's last-step traffic stays out and the start check's + start page's traffic
+    // is in.
+    const phaseFirstStep = phaseIndex ? ++step : 0;
+    reportStep = phaseFirstStep;
+    // Which controls THIS run filled, and with what — the overwrite guard below trusts only
+    // values the run itself typed, never a prefilled value that merely equals an input.
+    const filledByUs = new Map<string, string>();
     if (phaseIndex) {
       // A later phase starts on the SAME page/context: a path/URL, or a config check that
       // returns one (e.g. the set-password link read from a mailbox). A check that reports
@@ -234,7 +246,13 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       }
       await page.goto(startUrl.startsWith('http') ? startUrl : baseUrl + startUrl, { waitUntil: 'domcontentloaded' });
       await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-      await config.beforeEach?.(page);
+      // The hook was written for the scenario's start page (a consent banner); on a later
+      // phase's page it may find nothing and throw — that is not the phase's failure.
+      try {
+        await config.beforeEach?.(page);
+      } catch (e) {
+        trail.push({ op: 'BEFORE_EACH', label: `beforeEach failed on phase "${phase.name}" start: ${(e as Error).message.split('\n')[0].slice(0, 80)}`, text: null, conf: 1, ms: 0, url: mask(page.url()), phase: phase.name });
+      }
       history.length = 0;
       jevDone = false;
       loopReason = 'step budget used up';
@@ -326,12 +344,22 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // validates. Only Jev's own alternatives are considered, never any empty field on the
       // page: on a one-field page (an adversarial search box) typing the next hostile input
       // over the previous one IS the intended pattern (guard 4 submits it first).
-      if (d.action.kind === 'fill' && d.text !== null && d.action.value && d.action.value !== d.text && Object.values(phaseInputs).includes(d.action.value)) {
-        const holdsNothingOfOurs = (a: Action) => a.kind === 'fill' && (!a.value || !Object.values(phaseInputs).includes(a.value) || a.value === d.text);
+      const controlKey = (a: Action) => `${a.frame ?? 0}:${a.node}`;
+      const holdsOurs = (a: Action) => !!a.value && filledByUs.get(controlKey(a)) === a.value;
+      if (d.action.kind === 'fill' && d.text !== null && holdsOurs(d.action) && d.action.value !== d.text) {
+        const holdsNothingOfOurs = (a: Action) => a.kind === 'fill' && (!holdsOurs(a) || a.value === d.text);
         const alt = d.alternatives.find(holdsNothingOfOurs);
         if (alt) {
           trail[trail.length - 1].label += mask(` → holds another input, not overwritten: ${alt.label.slice(0, 40)}`);
           d.action = alt;
+        } else if (kind !== 'adversarial') {
+          // No better target offered. An adversarial scenario feeds every input into the same
+          // control by design (README "Guards"), so it may overwrite; any other kind maps inputs
+          // to fields, and overwriting a filled field can only make the form invalid — skip the
+          // fill and let Jev re-decide on a fresh observation (the stuck detectors end a loop).
+          trail[trail.length - 1].label += ' → holds another input, not overwritten (no alternative offered)';
+          history.push({ action: `${d.action.label} (holds another input, not overwritten)`, kind: 'wait', page_changed: null });
+          continue;
         }
       }
       // L2 harness fallback: Jev picked TYPE_TEXT with a value that's ALREADY the target field's
@@ -487,6 +515,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       const changed = JSON.stringify([after.url, after.text.length, after.actions.length]) !== before;
       history.push({ action: d.action.label, kind: d.action.kind, text: d.text, page_changed: changed });
       if (d.action.kind === 'fill' && d.text !== null) {
+        filledByUs.set(controlKey(d.action), d.text);
         submissionEvents.push({ kind: 'fill', text: d.text, ok: true, step });
         lastFill = { label: d.action.label, text: d.text, step, changed, autoSubmitted: false, node: d.action.node!, frame: d.action.frame };
       }
@@ -569,6 +598,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     const checkFinalCrash = async () => {
       const finalObs = await observe(page!).catch(() => null);
       if (finalObs) {
+        finalText = finalObs.text.slice(0, 1_500);
         const finalCrash = crashText.find((re) => re.test(finalObs.text));
         if (finalCrash) record(sink, finalObs.url, lastExecutedStep, 'crash-screen', finalCrash.source, { noise: config.noise, known: config.known });
       }
@@ -698,9 +728,10 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     requestsOmitted: timeline.requestsOmitted,
     responsesOmitted: timeline.responsesOmitted,
     video: videoName && `videos/${videoName}`,
+    finalText: finalText === undefined ? undefined : mask(finalText),
     intent: s.intent === undefined ? undefined : mask(s.intent),
     expectResults: expectResults?.map((r) => ({ ...r, assertion: maskDeep(r.assertion, mask) as ExpectResult['assertion'], expected: mask(r.expected), actual: mask(r.actual), phase: r.phase === undefined ? undefined : mask(r.phase) })),
-    submitted: [...submitted].map(mask), runId,
+    submitted: [...submitted].map(mask), runId: mask(runId),
   };
 }
 

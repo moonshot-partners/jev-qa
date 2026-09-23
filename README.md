@@ -49,7 +49,7 @@ the `scenarios` glob(s); see `src/scenario.ts` for the schema.
 | `src/expect.ts` | Pure `evaluate()` of `expect` assertions against a captured page state |
 | `src/submission.ts` | Pure `submittedInputs()`: STRONG-ONLY (round 8) — an own-origin request that demonstrably carries the value, in the fill's own window; `uninspectableRequest()` flags a plausible-but-unconfirmable candidate for a more specific BLOCKED reason |
 | `src/verdict.ts` | Pure `decideVerdict()` + `refusedByEnvironment()` |
-| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop (once per phase), parallel queue, results.json; `maskSecrets` |
+| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop (once per phase), parallel queue, results.json (incl. `finalText`, what the settled final page said); `maskSecrets` |
 | `src/report.ts` | HTML grid report + `summarize()` |
 | `src/replay.ts` | `replayUrls`/`replayRun`: re-request findings without Jev in the loop |
 | `src/env.ts` | Minimal `.env` loader |
@@ -285,7 +285,7 @@ that value out of every request surface; list its key under the scenario's
 
 Every harness lesson from the spike's `MORNING.md` survives extraction:
 
-0. On a multi-field form, a field that already holds another scenario input is never overwritten with a different one when Jev ranked an empty (or foreign) fill target as its next-best choice — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
+0. On a multi-field form, a field that already holds another scenario input THIS RUN TYPED THERE (a prefilled value that merely equals an input does not count) is never overwritten with a different one: the fill goes to the empty (or foreign) target Jev ranked next-best, or — outside adversarial runs, which feed every input into one control by design — is skipped so Jev re-decides on a fresh observation — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
 1. Hostile strings live in scenario `inputs`, never in a prompt — `src/jev.ts` (Jev only ranks offered targets/inputs, never generates text; `buildBody()` additionally redacts every occurrence of an input value out of everything else in the request — see guard 21).
 2. Hover-opened menus toggle closed on the first click after hover — `src/browser.ts:58`.
 3. Repeat guard: retake Jev's next-best target (or scroll) when it re-picks its last action — `src/runner.ts:140`.
@@ -392,8 +392,10 @@ context (login and cookies carry over):
 }
 ```
 
-- A phase's `response` assertions see only the responses recorded during that phase; an
-  earlier phase's traffic never satisfies a later phase's assertion.
+- A phase's `response` assertions see only the responses recorded during that phase, from its
+  own start navigation (or start check) on; an earlier phase's traffic never satisfies a later
+  phase's assertion. `beforeEach` runs again on each phase's start page; if it throws there
+  (a consent banner that is not on that page) the phase goes on and the trail notes it.
 - `start` is a path/URL, or `{ check: { name, args? } }`: the config check runs on the current
   page (it may read a mailbox, an API, a database) and returns `{ ok, detail, url }`; the phase
   begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run

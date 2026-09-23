@@ -168,6 +168,41 @@ test('a field that already holds another scenario input is never overwritten: th
     assert.equal(r.verdict, 'PASS', r.reason);
     assert.ok(hits.some((h) => h.startsWith('/two-done?') && new URLSearchParams(h.split('?')[1]).get('a') === 'one' && new URLSearchParams(h.split('?')[1]).get('b') === 'two'), `Alpha kept "one" and Beta got "two"; hits: ${hits.join(' ')}`);
     assert.ok(r.trail.some((t) => t.label.includes('holds another input, not overwritten: Beta')), 'the guard redirected the fill to the empty field');
+    assert.ok(r.finalText?.includes('Done two'), 'the settled final page text is recorded');
+
+    // Without an alternative, an acceptance run skips the overwrite (the field keeps its value).
+    hits.length = 0;
+    const stubborn = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (new URL(obs.url).pathname === '/two-done') return DONE;
+      const alpha = obs.actions.find((a) => a.label === 'Alpha' && a.kind === 'fill')!;
+      const fills = history.filter((h) => h.kind === 'fill').length;
+      if (fills === 0) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.alpha };
+      if (history.length < 3) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.beta };
+      return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+    };
+    const [k] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [{ ...s, name: 'acceptance/two-stubborn', expect: [{ url: 'a=one' }] }], concurrency: 1, repeat: 1, outDir: join(dir, 'out2'), deps: { decide: stubborn } });
+    assert.equal(k.verdict, 'PASS', k.reason);
+    assert.ok(hits.some((h) => h.startsWith('/two-done?') && new URLSearchParams(h.split('?')[1]).get('a') === 'one'), `Alpha kept "one"; hits: ${hits.join(' ')}`);
+    assert.ok(k.trail.some((t) => t.label.includes('no alternative offered')));
+
+    // A PREFILLED value that merely equals an input is not "ours": overwriting it is allowed.
+    const prefilledHtml = TWO_FIELDS_HTML.replace('id="a" name="a" type="text"', 'id="a" name="a" type="text" value="one"');
+    const server2 = createServer((req, res) => { const url = new URL(req.url ?? '/', 'http://127.0.0.1'); hits.push(url.pathname + url.search); res.writeHead(200, { 'content-type': 'text/html' }); res.end(url.pathname === '/two-done' ? '<!doctype html><html><body><p>Done two</p></body></html>' : prefilledHtml); });
+    await new Promise<void>((r) => server2.listen(0, '127.0.0.1', r));
+    try {
+      const base2 = `http://127.0.0.1:${(server2.address() as AddressInfo).port}`;
+      const overwrite = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+        if (new URL(obs.url).pathname === '/two-done') return DONE;
+        const alpha = obs.actions.find((a) => a.label === 'Alpha' && a.kind === 'fill')!;
+        if (!history.some((h) => h.kind === 'fill')) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.beta };
+        return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+      };
+      hits.length = 0;
+      const [pf] = await runAll({ config: configFor(base2, {}), dir, envName: 'local', scenarios: [{ ...s, name: 'acceptance/two-prefilled', expect: [{ url: 'a=two' }] }], concurrency: 1, repeat: 1, outDir: join(dir, 'out3'), deps: { decide: overwrite } });
+      assert.equal(pf.verdict, 'PASS', pf.reason);
+    } finally {
+      server2.close();
+    }
   } finally {
     server.close();
   }
@@ -196,6 +231,20 @@ test('a REFUSED run masks a secret quoted in its intent; a phase response assert
     assert.equal(w.verdict, 'FAIL', w.reason);
     assert.match(w.reason, /phase "then #1" expect #1 response: /);
     assert.equal(w.expectResults![0].ok, true, 'the main phase\'s own response assertion passes');
+
+    // The start page's own response (step 0) and a later phase's start page response are in their windows.
+    const starts: Scenario = {
+      name: 'acceptance/start-window', kind: 'acceptance', role: null, start: '/a', goal: 'register', inputs: { email: 'qa-{{run}}@example.test' },
+      expect: [{ response: { method: 'GET', url: '/a', status: 200 } }],
+      then: [{ start: { check: { name: 'link' } }, goal: 'set', inputs: { password: 'Pw-{{run}}!' }, expect: [{ response: { method: 'GET', url: 'token=abc', status: 200 } }] }],
+    };
+    const [st] = await runAll({ config, dir, envName: 'rw', scenarios: [starts], concurrency: 1, repeat: 1, outDir: join(dir, 'out3'), deps: { decide } });
+    assert.equal(st.verdict, 'PASS', st.reason);
+
+    // A secret equal to the run id never leaks through `runId`.
+    const viaRun: Scenario = { name: 'acceptance/run-secret', kind: 'acceptance', role: null, start: '/a', goal: 'g', inputs: { password: '{{run}}' }, expect: [{ url: '/a' }], secretInputs: ['password'] };
+    const [vr] = await runAll({ config, dir, envName: 'rw', scenarios: [viaRun], concurrency: 1, repeat: 1, outDir: join(dir, 'out4'), deps: { decide: async () => DONE } });
+    assert.equal(vr.runId, '«password»');
   } finally {
     server.close();
   }
