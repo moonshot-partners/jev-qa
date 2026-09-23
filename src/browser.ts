@@ -16,7 +16,10 @@ const SNAPSHOT = readFileSync(new URL('./snapshot.js', import.meta.url), 'utf8')
 
 type Box = { x: number; y: number; w: number; h: number };
 
-// Per page: the frames the last observe() snapshotted, in Action.frame order (0 = main).
+// Per page: every frame any observe() has seen, in first-seen order (0 = main). Indices are
+// STABLE for the page's lifetime — a frame keeps its index across observations and a new frame
+// is appended, never inserted — so an action or `lastFill` decided against one observation
+// still names the same frame after the page re-rendered and the next observation ran.
 const frameTables = new WeakMap<Page, Frame[]>();
 
 function frameOf(page: Page, index: number | undefined): Frame {
@@ -26,11 +29,12 @@ function frameOf(page: Page, index: number | undefined): Frame {
   return frame;
 }
 
-// The frame's own <iframe> element box in MAIN-FRAME viewport coordinates (Playwright's
-// boundingBox() is relative to the main frame, nested frames included). Null when the frame
-// element cannot be resolved or has no box (detached, display:none). With `scroll`, first
-// brings the <iframe> into the main viewport — scrollIntoView inside a frame never scrolls
-// its parent.
+// The frame's CONTENT box (where its viewport starts) in MAIN-FRAME coordinates: Playwright's
+// boundingBox() is the <iframe> element's border box relative to the main frame (nested frames
+// included), so the element's own border and padding are added — a framed control's
+// frame-local coordinates count from inside them. Null when the frame element cannot be
+// resolved or has no box (detached, display:none). With `scroll`, first brings the <iframe>
+// into the main viewport — scrollIntoView inside a frame never scrolls its parent.
 async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
   if (frame === frame.page().mainFrame()) return { x: 0, y: 0, w: Infinity, h: Infinity };
   const el = await frame.frameElement().catch(() => null);
@@ -38,7 +42,15 @@ async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
   try {
     if (scroll) await el.scrollIntoViewIfNeeded({ timeout: 2_000 }).catch(() => {});
     const box = await el.boundingBox();
-    return box ? { x: box.x, y: box.y, w: box.width, h: box.height } : null;
+    if (!box) return null;
+    const inset = await el
+      .evaluate((e) => {
+        const cs = getComputedStyle(e as Element);
+        const px = (v: string) => parseFloat(v) || 0;
+        return { l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom) };
+      })
+      .catch(() => ({ l: 0, t: 0, r: 0, b: 0 }));
+    return { x: box.x + inset.l, y: box.y + inset.t, w: Math.max(0, box.width - inset.l - inset.r), h: Math.max(0, box.height - inset.t - inset.b) };
   } finally {
     await el.dispose().catch(() => {});
   }
@@ -65,7 +77,8 @@ async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promi
       continue; // about:blank, mid-navigation, or a frame that refuses evaluation: not actionable
     }
     if (!sub) continue;
-    const index = frames.push(frame) - 1;
+    let index = frames.indexOf(frame);
+    if (index < 0) index = frames.push(frame) - 1;
     for (const a of sub.actions) {
       if (a.node === undefined || !a.rect) continue;
       const rect = { x: a.rect.x + box.x, y: a.rect.y + box.y, w: a.rect.w, h: a.rect.h };
@@ -87,7 +100,7 @@ export async function observe(page: Page): Promise<Observation> {
     try {
       const obs = (await page.evaluate(SNAPSHOT)) as Observation | null;
       if (obs) {
-        const frames: Frame[] = [page.mainFrame()];
+        const frames: Frame[] = frameTables.get(page) ?? [page.mainFrame()];
         await mergeFrames(page, obs, frames);
         frameTables.set(page, frames);
         obs.actions.push({ id: 'press_enter', kind: 'key', label: 'Press Enter in the focused field (submit a typed search or form)' });

@@ -22,7 +22,7 @@ const OUTER_HTML = (overlay: boolean) => `<!doctype html>
 <input id="outer" type="text" aria-label="Name">
 <input id="pw" type="password" aria-label="Password">
 <div style="height:150px"></div>
-<iframe id="f" src="/inner" style="width:400px;height:200px;border:0"></iframe>
+<iframe id="f" src="/inner" style="width:400px;height:200px;border:10px solid #888;padding:6px"></iframe>
 ${overlay ? '<div id="overlay" style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:10;background:rgba(0,0,0,0.01)"></div>' : ''}
 <div style="height:1200px"></div>
 </body></html>`;
@@ -66,9 +66,11 @@ test('frames: the snapshot lists frame-hosted controls with page coordinates, an
     assert.ok(pay, 'the framed button is offered as a click target');
     assert.equal(card!.frame, 1, 'it carries the frame index');
     assert.equal(obs.actions.find((a) => a.label === 'Name')!.frame, undefined, 'main-document targets carry no frame');
-    // Geometry is translated into page coordinates: inside the iframe's own box, below the spacer.
-    assert.ok(card!.rect!.y > iframeBox.y && card!.rect!.y < iframeBox.y + iframeBox.height, `framed input y=${card!.rect!.y} inside iframe box y=${iframeBox.y}..${iframeBox.y + iframeBox.height}`);
-    assert.ok(card!.rect!.x >= iframeBox.x, 'framed input x is offset by the iframe box');
+    // Geometry is translated into page coordinates: the iframe's border box PLUS its border and
+    // padding (16px here), then the control's own frame-local position.
+    const local = await inner.evaluate(() => { const r = document.getElementById('card')!.getBoundingClientRect(); return { x: r.x, y: r.y }; });
+    assert.ok(Math.abs(card!.rect!.x - (iframeBox.x + 16 + local.x)) < 1, `framed input x=${card!.rect!.x}, expected ${iframeBox.x} + 16 + ${local.x}`);
+    assert.ok(Math.abs(card!.rect!.y - (iframeBox.y + 16 + local.y)) < 1, `framed input y=${card!.rect!.y}, expected ${iframeBox.y} + 16 + ${local.y}`);
     assert.ok(obs.text.includes('Card number'), 'frame text is appended to the page text');
     assert.ok(obs.text.includes('Checkout'), 'main text is kept');
 
@@ -83,6 +85,23 @@ test('frames: the snapshot lists frame-hosted controls with page coordinates, an
 
     await act(page, pay!, null);
     assert.equal(await inner.title(), 'paid', 'clicking by page coordinates reaches the framed button');
+
+    // Frame indices are stable across observations: a frame inserted BEFORE the payment frame
+    // by a re-render must not shift the index an earlier decision (or lastFill) still holds.
+    await page.evaluate(() => {
+      const extra = document.createElement('iframe');
+      extra.src = '/inner';
+      extra.style.cssText = 'width:300px;height:100px';
+      document.body.insertBefore(extra, document.getElementById('f'));
+    });
+    await page.waitForTimeout(500);
+    const again = await observe(page);
+    const cardAgain = again.actions.filter((a) => a.label === 'Card number' && a.kind === 'fill');
+    assert.equal(cardAgain.length, 2, 'both frames offer a card field now');
+    assert.ok(cardAgain.some((a) => a.frame === card!.frame), 'the original frame keeps its index');
+    assert.ok(cardAgain.some((a) => a.frame === 2), 'the new frame gets the next index');
+    await act(page, cardAgain.find((a) => a.frame === card!.frame)!, 'still-here');
+    assert.equal(await inner.evaluate(() => (document.getElementById('card') as HTMLInputElement).value), 'still-here', 'the original index still reaches the original frame');
     await page.close();
   } finally {
     await browser?.close();

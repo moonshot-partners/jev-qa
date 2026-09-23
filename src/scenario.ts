@@ -60,14 +60,37 @@ export function newRunId(): string {
 // start, goal, inputs, expect, phases (including check args) — replaced by `runId`. `name` is
 // left alone: results are grouped and reported by it, and it must stay stable across runs.
 export function applyRunId<T extends { name: string }>(scenario: T, runId: string): T {
+  // Only plain JSON-shaped data is rebuilt; anything else (a Date, a RegExp, a class instance a
+  // config's smoke() handed a check as args) is passed through untouched.
+  const plain = (v: object) => {
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+  };
   const walk = (v: unknown): unknown => {
     if (typeof v === 'string') return v.split(RUN_PLACEHOLDER).join(runId);
     if (Array.isArray(v)) return v.map(walk);
-    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
+    if (v && typeof v === 'object' && plain(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]));
     return v;
   };
   const { name, ...rest } = scenario;
   return { name, ...(walk(rest) as object) } as T;
+}
+
+// Every input value a run can type, across the scenario and all its phases, keyed by input key
+// — a key reused by two phases with different values lists both. The verdict's "every input
+// reached the server" rule, and the redaction of one phase's values while another phase runs,
+// both need the whole set, not just the phase in hand.
+export function scenarioInputs(s: Pick<Scenario, 'inputs' | 'then'>): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  const add = (inputs?: Record<string, string>) => {
+    for (const [k, v] of Object.entries(inputs ?? {})) {
+      (out[k] ??= []);
+      if (!out[k].includes(v)) out[k].push(v);
+    }
+  };
+  add(s.inputs);
+  for (const p of s.then ?? []) add(p.inputs);
+  return out;
 }
 
 // The phases a run executes in order: the scenario's own fields first, then each `then` entry

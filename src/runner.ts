@@ -8,10 +8,10 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { act, focusAndVerify, observe } from './browser.ts';
 import { resolveBaseUrl, type Config } from './config.ts';
 import { evaluate, type ExpectResult } from './expect.ts';
-import { decide as realDecide, newPseudonyms, type Decision, type HistoryEntry, type Observation } from './jev.ts';
+import { decide as realDecide, newPseudonyms, redactValue, type Decision, type HistoryEntry, type Observation } from './jev.ts';
 import { DEFAULT_CRASH_TEXT, drainPending, newSink, record, watch, type Finding, type RequestRecord, type ResponseRecord } from './oracles.ts';
 import { renderReport } from './report.ts';
-import { applyRunId, newRunId, scenarioPhases, type Scenario } from './scenario.ts';
+import { applyRunId, newRunId, scenarioInputs, scenarioPhases, type Scenario } from './scenario.ts';
 import { needsRescue, partialMatch, submittedInputs, uninspectableRequest, type SubmissionEvent } from './submission.ts';
 import { decideVerdict, refusedByEnvironment, type Verdict } from './verdict.ts';
 
@@ -64,13 +64,12 @@ function emptyResult(s: Scenario, kind: Result['kind'], run: number, verdict: Ve
 // in the first place (jev.ts redact()); this keeps it out of results.json and the report too.
 export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 'secretInputs'>): string {
   if (!s.secretInputs?.length) return text;
-  const values: Record<string, string> = { ...(s.inputs ?? {}) };
-  for (const p of s.then ?? []) Object.assign(values, p.inputs ?? {});
+  const values = scenarioInputs(s);
   let out = text;
-  for (const key of s.secretInputs) {
-    const v = values[key];
-    if (v) out = out.split(v).join(`«${key}»`);
-  }
+  // Every value the key ever had (a phase may reuse a key with a new value), in every form the
+  // Jev-side redaction covers (raw, percent/form-encoded — a GET form carries it that way in a
+  // request URL — HTML-escaped, JSON-escaped): redactValue() is the same routine buildBody() uses.
+  for (const key of s.secretInputs) for (const v of values[key] ?? []) out = redactValue(out, v, `«${key}»`);
   return out;
 }
 
@@ -108,6 +107,10 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   const s = applyRunId(scenario, runId);
   const phases = scenarioPhases(s);
   const mask = (text: string) => maskSecrets(text, s);
+  // Every input across every phase, flattened for the verdict's "each input reached the server"
+  // rule: a key reused with a second value in a later phase appears again as `key#2`.
+  const allInputs: Record<string, string> = {};
+  for (const [k, vs] of Object.entries(scenarioInputs(s))) vs.forEach((v, i) => (allInputs[i ? `${k}#${i + 1}` : k] = v));
   const kind = s.kind ?? 'acceptance';
   const env = config.environments[envName];
   if (refusedByEnvironment(s, env)) {
@@ -173,6 +176,11 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     const phase = phases[phaseIndex];
     const phaseLabel = phaseIndex ? phase.name : undefined;
     const phaseInputs: Record<string, string> = { ...(s.inputs ?? {}), ...(phase.inputs ?? {}) };
+    // Values from OTHER phases are not offered to type here, but a page may still echo one (the
+    // email typed at sign-up shown on the next page): redact them like config secrets.
+    const offered = new Set(Object.values(phaseInputs));
+    const phaseSecrets = [...secrets, ...Object.values(allInputs).filter((v) => !offered.has(v))];
+    const phaseFirstStep = step + 1;
     if (phaseIndex) {
       // A later phase starts on the SAME page/context: a path/URL, or a config check that
       // returns one (e.g. the set-password link read from a mailbox). A check that reports
@@ -216,10 +224,15 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     // Fed to decide() so buildBody() can prune them from the request entirely; see jev.ts's
     // module doc comment for why redaction alone left Jev unable to tell a field was already
     // correctly filled.
+    // Certification is judged per PHASE: only fills and requests from this phase's own steps.
+    // A value certified in an earlier phase (the email typed at sign-up) must still be offered
+    // when a later phase needs it again (the same email on the login page) — otherwise
+    // buildBody() would prune the key and TYPE_TEXT with it.
+    const thisPhase = <T extends { step: number }>(events: T[]) => events.filter((e) => e.step >= phaseFirstStep);
     const certifiedKeys = (): Set<string> => {
       const eventsSoFar: SubmissionEvent[] = [
-        ...submissionEvents,
-        ...sink.requests.map(
+        ...thisPhase(submissionEvents),
+        ...thisPhase(sink.requests).map(
           (r): SubmissionEvent => ({ kind: 'request', step: r.step, method: r.method, url: r.url, postData: r.postData, bodyOversized: r.bodyOversized, contentType: r.contentType }),
         ),
       ];
@@ -238,11 +251,11 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       const crash = crashText.find((re) => re.test(obs.text));
       if (crash) record(sink, obs.url, step, 'crash-screen', crash.source, { noise: config.noise, known: config.known });
       const certified = certifiedKeys();
-      const d: Decision = await decide(obs, phase.goal, phaseInputs, history, certified, secrets, pseudonyms);
+      const d: Decision = await decide(obs, phase.goal, phaseInputs, history, certified, phaseSecrets, pseudonyms);
       jevMs += d.latencyMs;
       tokens += d.inputTokens;
       const degradedNote = d.degraded ? ` (degraded: ${d.degraded})` : '';
-      trail.push({ op: d.operation, label: (d.action?.label ?? '') + degradedNote, text: d.text === null ? null : mask(d.text), conf: d.confidence, ms: d.latencyMs, url: obs.url, phase: phaseLabel });
+      trail.push({ op: d.operation, label: mask((d.action?.label ?? '') + degradedNote), text: d.text === null ? null : mask(d.text), conf: d.confidence, ms: d.latencyMs, url: mask(obs.url), phase: phaseLabel });
       if (d.operation === 'DONE') {
         jevDone = true;
         loopReason = 'Jev: goal satisfied';
@@ -332,7 +345,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // text. Tracked via `lastFill`, not the immediately previous history entry — a BLOCKED
       // settle retry (below) pushes its own 'wait' entry in between, and this must still fire
       // across that gap. Never record a submit event when the Enter press itself fails.
-      if (d.action.kind === 'fill' && lastFill && !lastFill.autoSubmitted && lastFill.label === d.action.label && lastFill.changed === false && lastFill.text !== d.text) {
+      if (d.action.kind === 'fill' && lastFill && !lastFill.autoSubmitted && lastFill.label === d.action.label && lastFill.node === d.action.node && (lastFill.frame ?? 0) === (d.action.frame ?? 0) && lastFill.changed === false && lastFill.text !== d.text) {
         // O10 (round 9): before forcing an Enter press to submit the about-to-be-lost value,
         // give a debounced request a chance to land on its own — poll certifiedKeys() every
         // 250ms for up to 1.5s. Only a value that's actually one of this scenario's own inputs
@@ -454,8 +467,8 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         // heuristic — that heuristic suppressed the rescue on evidence that doesn't certify
         // (an inert click, an unrelated poll request), leaving a real hostile input unsubmitted.
         const eventsSoFar: SubmissionEvent[] = [
-          ...submissionEvents,
-          ...sink.requests.map(
+          ...thisPhase(submissionEvents),
+          ...thisPhase(sink.requests).map(
             (r): SubmissionEvent => ({ kind: 'request', step: r.step, method: r.method, url: r.url, postData: r.postData, bodyOversized: r.bodyOversized, contentType: r.contentType }),
           ),
         ];
@@ -564,7 +577,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     // first (checked first: it's the more actionable, and the more likely, of the two — real
     // apps truncate long inputs far more often than they send an uninspectable body), else a
     // PLAUSIBLE-but-unconfirmable request. The BLOCKED reason can then say so specifically.
-    for (const [k, v] of Object.entries(s.inputs ?? {})) {
+    for (const [k, v] of Object.entries(allInputs)) {
       if (submitted.has(v)) continue;
       const partial = partialMatch(finalEvents, v);
       if (partial) {
@@ -587,7 +600,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       .catch((e) => cleanupErrors.push(`screenshot: ${(e as Error).message}`));
   }
   const { verdict, reason: verdictReason } = decideVerdict({
-    kind, jevDone, loopReason, inputs: s.inputs, submitted, findings, expectResults, error, missingDetail,
+    kind, jevDone, loopReason, inputs: Object.keys(allInputs).length ? allInputs : undefined, submitted, findings, expectResults, error, missingDetail,
   });
   let reason = mask(verdictReason);
   const video = page?.video();
@@ -608,14 +621,23 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   if (unreadBodies > 0) reason += ` (${unreadBodies} response bodies unread)`;
 
   const calls = trail.length;
+  // Everything that leaves this function is a run OUTPUT (results.json, report.html, the
+  // console line): a secret input's value — in any encoding — is masked out of all of it.
+  const timeline = persistedTimeline(requests, responses);
   return {
     name: s.name, kind, run, verdict, reason, steps: calls,
     seconds: Math.round((performance.now() - started) / 100) / 10,
     jevCalls: calls, jevMsAvg: calls ? Math.round(jevMs / calls) : 0, inputTokens: tokens,
-    findings, trail,
-    ...persistedTimeline(requests, responses),
+    findings: findings.map((f) => ({ ...f, detail: mask(f.detail), url: mask(f.url) })),
+    trail,
+    requests: timeline.requests.map((r) => ({ ...r, url: mask(r.url) })),
+    responses: timeline.responses.map((r) => ({ ...r, url: mask(r.url) })),
+    requestsOmitted: timeline.requestsOmitted,
+    responsesOmitted: timeline.responsesOmitted,
     video: videoName && `videos/${videoName}`,
-    intent: s.intent, expectResults, submitted: [...submitted].map(mask), runId,
+    intent: s.intent,
+    expectResults: expectResults?.map((r) => ({ ...r, expected: mask(r.expected), actual: mask(r.actual) })),
+    submitted: [...submitted].map(mask), runId,
   };
 }
 

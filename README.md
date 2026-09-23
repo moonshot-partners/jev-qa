@@ -255,11 +255,14 @@ the origin boundary), so the engine never needs DOM access from the parent. A fr
 control is offered like any other, with:
 
 - `frame`: an index into the frame table `observe()` keeps per page (0/absent = the main
-  document). Node ids are per frame, so Jev's element list keys on `frame:node`.
-- geometry translated to page coordinates by the `<iframe>` element's own box (nested
-  frames included, via Playwright's main-frame-relative `boundingBox()`); a control whose
-  centre falls outside its iframe's box or the viewport is dropped, as the browser could
-  not deliver a click there.
+  document). Indices are assigned in first-seen order and never reused for the page's
+  lifetime, so a frame inserted by a re-render is appended and never shifts an index an
+  earlier decision still holds. Node ids are per frame, so Jev's element list keys on
+  `frame:node`.
+- geometry translated to page coordinates by the `<iframe>` element's content box (its
+  border box from Playwright's main-frame-relative `boundingBox()`, nested frames included,
+  plus the element's own border and padding); a control whose centre falls outside its
+  iframe's box or the viewport is dropped, as the browser could not deliver a click there.
 - the frame's visible text appended to the page text.
 
 Input is unchanged — click at page `x,y`, then type — so a cross-origin card field is
@@ -397,6 +400,15 @@ context (login and cookies carry over):
   scenario's; the same key in a phase overrides). Jev's history restarts per phase; the oracle,
   the trail and the step counter continue. The next phase runs only when the previous one
   reached Jev DONE with every expectation met.
+- **Certification is per phase.** A value the main phase already got certified (the sign-up
+  email) is offered again, uncertified, to a phase that needs it once more (the same email on
+  the login page); the adversarial verdict still requires EVERY input of every phase to have
+  reached the server (a key reused with a new value counts twice, reported as `key#2`).
+- **Redaction spans phases.** While one phase runs, the input values of every other phase are
+  redacted from Jev requests as secrets (a page that echoes what an earlier phase typed).
+- A failed expectation — including a phase whose start check reported `ok: false` — is FAIL
+  for **every** kind, smoke and adversarial included (only acceptance is *required* to carry
+  expectations; any kind that has them is held to them).
 - Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
   the verdict is the scenario's as a whole.
 
@@ -411,9 +423,17 @@ different ids.
 ### `secretInputs`
 
 Keys of `inputs` (or a phase's inputs) whose value must not reach `results.json` or the
-report: the trail's typed text, the certified-inputs list and the reason show `«key»` instead.
-Every input value is already kept out of Jev requests (see Secrets); this covers the run's
-own outputs, for a password set during the run.
+report: the trail (typed text, labels, urls), the persisted request/response urls, the
+findings, the expectation results, the certified-inputs list and the reason show `«key»`
+instead — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
+a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
+phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
+run's own outputs, for a password set during the run.
+
+**Not covered:** a value the run never typed — e.g. a one-time token inside the url a start
+check returned — is scrubbed from Jev requests by the generic `«token:N»` rule but persists
+raw in `results.json`'s request urls, as any tokenised url always has. Keep run output private,
+or have the check return a url whose token is already consumed by the time the report is read.
 
 ## Known limitations
 
@@ -422,7 +442,9 @@ own outputs, for a password set during the run.
 - Frames: the parent-side hit test checks the MAIN document only (the point must land on an `<iframe>`);
   an intermediate frame of a deeper nesting is not checked separately. A frame that refuses evaluation
   (about:blank, mid-navigation) is skipped for that step. Frame text is appended after the main text and
-  clipped with it.
+  clipped with it. The repeat guard compares action labels, so two frames offering a control with the
+  SAME label (two "Continue" buttons) can trip it; the replace guard keys on the exact control (node +
+  frame) and is not affected.
 - A click is one `mouse.click` at page coordinates (down and up in one go). A page whose layout shifts ON
   MOUSEDOWN (a field blurs, a block expands, the button moves out from under the pointer — seen with a
   hosted payment element's "save my info" block) can swallow a slower, human-paced press that this fast
@@ -514,24 +536,31 @@ unrelated wait, is what lets a value certify without the runner ever
 forcing an Enter into the field; both values end up submitted and the
 trail carries no `auto-submitted previous value` entry.
 `test/phases.test.ts` covers `newRunId()`, `applyRunId()` (every string but `name`,
-check args included, original untouched), `scenarioPhases()`, `maskSecrets()`, the
-phase-naming verdict reason, and scenario validation of `then`/`secretInputs`.
+check args included, original untouched, non-plain objects such as a Date passed
+through), `scenarioPhases()`, `scenarioInputs()`, `maskSecrets()` (encoded forms, a
+reused key's every value), the verdict on a failed phase for every kind, and
+scenario validation of `then`/`secretInputs`.
 `test/phases.browser.test.ts` runs the real runner (fake `decide`) through a
 two-phase scenario: the main phase submits a `{{run}}` email, a config check
 receives the substituted args and returns the second phase's start url, the
-second phase types a `{{run}}` password (`secretInputs`) and its own
-expectations are evaluated and tagged — the certified list carries `«password»`,
-and the value appears nowhere in the result; a second scenario proves a check
-reporting `ok: false` FAILs the run naming the phase, and one returning no url
-reports ERROR.
+second phase types the SAME email again (offered uncertified: certification is per
+phase) plus a `{{run}}` password (`secretInputs`) and its own expectations are
+evaluated and tagged — the certified list carries `«password»`, the value appears
+nowhere in the result in any encoding (the GET form carried it as `%21`), and the
+later phase's password was already redacted as a secret while the main phase ran; a
+second scenario proves a check reporting `ok: false` FAILs the run naming the phase
+(for a smoke scenario too), and one returning no url reports ERROR.
 `test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
 page embedding an `<iframe>`: the framed input and button are offered with
 page coordinates and `frame: 1`, typing/clicking by those coordinates lands
 inside the frame, a main-document overlay over the iframe makes `act()`
 refuse (`occluded`) while the frame-side snapshot alone could never see it
 (mutation-checked), the same node id in two frames stays two Jev elements,
-and a password field is offered by name with its value never read before or
-after typing — while `buildBody()` never sends the input value.
+a frame inserted before the payment frame by a re-render does not shift the
+index an earlier action holds, the iframe's border and padding are accounted
+for in the translated geometry, and a password field is offered by name with
+its value never read before or after typing — while `buildBody()` never sends
+the input value.
 `test/replay.browser.test.ts` proves `replayUrls()` releases its browser
 even when `role.login()` throws. Set `JEV_QA_NO_BROWSER=1` to skip both
 browser files. `test/runner.test.ts` unit-tests `capRecent()` and

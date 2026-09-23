@@ -181,7 +181,7 @@ function prefixPattern(value: string): RegExp | null {
 // truncated prefix — see prefixPattern()) to ONE marker. Shared by redact() (per-input, marker
 // is the input's own «key») and the config-secrets pass (round 8, N2 — marker is always
 // «secret», since a config secret has no scenario-input key to redact it BY).
-function redactValue(text: string, value: string, marker: string): string {
+export function redactValue(text: string, value: string, marker: string): string {
   if (!value) return text;
   let out = text;
   for (const variant of new Set(redactionForms(value))) {
