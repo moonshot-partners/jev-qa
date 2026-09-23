@@ -185,6 +185,21 @@ test('a field that already holds another scenario input is never overwritten: th
     assert.ok(hits.some((h) => h.startsWith('/two-done?') && new URLSearchParams(h.split('?')[1]).get('a') === 'one'), `Alpha kept "one"; hits: ${hits.join(' ')}`);
     assert.ok(k.trail.some((t) => t.label.includes('no alternative offered')));
 
+    // An inputFields hint retargets the fill: Jev names Alpha for input beta, the hint says Beta.
+    hits.length = 0;
+    const mistargets = async (obs: Observation, _goal: string, inputs: Record<string, string>, history: HistoryEntry[]): Promise<Decision> => {
+      if (new URL(obs.url).pathname === '/two-done') return DONE;
+      const alpha = obs.actions.find((a) => a.label === 'Alpha' && a.kind === 'fill')!;
+      const fills = history.filter((h) => h.kind === 'fill').length;
+      if (fills === 0) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.alpha };
+      if (fills === 1) return { ...DONE, operation: 'TYPE_TEXT', action: alpha, text: inputs.beta }; // wrong target, no alternatives
+      return { ...DONE, operation: 'CLICK', action: obs.actions.find((a) => a.label === 'Go' && a.kind === 'click')! };
+    };
+    const [hinted] = await runAll({ config: configFor(base, {}), dir, envName: 'local', scenarios: [{ ...s, name: 'acceptance/two-hinted', inputFields: { beta: '/^beta$/i' } }], concurrency: 1, repeat: 1, outDir: join(dir, 'out5'), deps: { decide: mistargets } });
+    assert.equal(hinted.verdict, 'PASS', hinted.reason);
+    assert.ok(hits.some((h) => h.startsWith('/two-done?') && new URLSearchParams(h.split('?')[1]).get('a') === 'one' && new URLSearchParams(h.split('?')[1]).get('b') === 'two'), `the hint put beta into Beta; hits: ${hits.join(' ')}`);
+    assert.ok(hinted.trail.some((t) => t.label.includes('inputFields: Beta')));
+
     // A PREFILLED value that merely equals an input is not "ours": overwriting it is allowed.
     const prefilledHtml = TWO_FIELDS_HTML.replace('id="a" name="a" type="text"', 'id="a" name="a" type="text" value="one"');
     const server2 = createServer((req, res) => { const url = new URL(req.url ?? '/', 'http://127.0.0.1'); hits.push(url.pathname + url.search); res.writeHead(200, { 'content-type': 'text/html' }); res.end(url.pathname === '/two-done' ? '<!doctype html><html><body><p>Done two</p></body></html>' : prefilledHtml); });

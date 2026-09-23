@@ -11,7 +11,7 @@ import { evaluate, type ExpectResult } from './expect.ts';
 import { decide as realDecide, newPseudonyms, redactValue, type Action, type Decision, type HistoryEntry, type Observation } from './jev.ts';
 import { DEFAULT_CRASH_TEXT, drainPending, newSink, record, watch, type Finding, type RequestRecord, type ResponseRecord } from './oracles.ts';
 import { renderReport } from './report.ts';
-import { applyRunId, newRunId, scenarioInputs, scenarioPhases, type Scenario } from './scenario.ts';
+import { applyRunId, hintedTarget, newRunId, scenarioInputs, scenarioPhases, type Scenario } from './scenario.ts';
 import { needsRescue, partialMatch, submittedInputs, uninspectableRequest, type SubmissionEvent } from './submission.ts';
 import { decideVerdict, refusedByEnvironment, type Verdict } from './verdict.ts';
 
@@ -209,6 +209,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     const phase = phases[phaseIndex];
     const phaseLabel = phaseIndex ? phase.name : undefined;
     const phaseInputs: Record<string, string> = { ...(s.inputs ?? {}), ...(phase.inputs ?? {}) };
+    const phaseFields: Record<string, string> = { ...(s.inputFields ?? {}), ...(phase.inputFields ?? {}) };
     // Values from OTHER phases are not offered to type here, but a page may still echo one (the
     // email typed at sign-up shown on the next page): redact them like config secrets.
     const offered = new Set(Object.values(phaseInputs));
@@ -344,6 +345,16 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // validates. Only Jev's own alternatives are considered, never any empty field on the
       // page: on a one-field page (an adversarial search box) typing the next hostile input
       // over the previous one IS the intended pattern (guard 4 submits it first).
+      // An `inputFields` hint binds the chosen input to its field: retarget the fill to the
+      // offered control whose label matches, whatever target Jev named (see scenario.ts).
+      if (d.action.kind === 'fill' && d.text !== null) {
+        const key = Object.entries(phaseInputs).find(([, v]) => v === d.text)?.[0];
+        const hinted = key !== undefined ? hintedTarget(phaseFields[key], obs.actions) : undefined;
+        if (hinted && hinted !== d.action && !(hinted.node === d.action.node && (hinted.frame ?? 0) === (d.action.frame ?? 0))) {
+          trail[trail.length - 1].label += mask(` → inputFields: ${hinted.label.slice(0, 40)}`);
+          d.action = hinted;
+        }
+      }
       const controlKey = (a: Action) => `${a.frame ?? 0}:${a.node}`;
       const holdsOurs = (a: Action) => !!a.value && filledByUs.get(controlKey(a)) === a.value;
       if (d.action.kind === 'fill' && d.text !== null && holdsOurs(d.action) && d.action.value !== d.text) {

@@ -362,8 +362,8 @@ The loader dynamic-imports the file and validates it at run time.
 | `scenarios` | `string` or `string[]` | Glob(s) relative to the config file's directory, e.g. `scenarios/**/*.json`. |
 
 Scenario fields: `name`, `kind` (`smoke` / `adversarial` / `acceptance`; inferred from the `smoke/` and
-`adversarial/` name prefixes when absent), `role`, `start`, `goal`, `inputs`, `maxSteps`, `expect`,
-`mutates`, `intent`, `then`, `secretInputs`. See `src/scenario.ts` for validation rules (an acceptance
+`adversarial/` name prefixes when absent), `role`, `start`, `goal`, `inputs`, `inputFields`, `maxSteps`,
+`expect`, `mutates`, `intent`, `then`, `secretInputs`. See `src/scenario.ts` for validation rules (an acceptance
 scenario needs at least one `expect`; an adversarial one needs at least one input).
 
 ### Phases: `then`
@@ -420,6 +420,23 @@ context (login and cookies carry over):
   the obligation.
 - Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
   the verdict is the scenario's as a whole.
+
+### `inputFields` — bind an input to its field
+
+Jev answers "which control" and "which input" as two independent questions, so on a long
+form the pairing drifts: the postcode lands in the country field, a card number in the ZIP.
+`inputFields` (on the scenario or on a phase, merged like `inputs`) binds an input key to the
+field it belongs in, by label — a case-insensitive substring or a `/regex/`:
+
+```json
+"inputs": { "postcode": "E1 6AN", "country": "United Kingdom" },
+"inputFields": { "postcode": "ZIP Code", "country": "/^Country/i" }
+```
+
+Jev still decides *when* to type and *which* input; the engine then types it into the offered
+fill target whose label matches (frame-hosted controls included), whatever target Jev named,
+and notes `→ inputFields: <label>` in the trail. A hint that matches nothing on the current
+page falls back to Jev's own target. Every key must be one of that scope's inputs.
 
 ### `{{run}}` — a value unique to each run
 

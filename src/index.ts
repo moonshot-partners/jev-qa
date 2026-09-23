@@ -2,4 +2,4 @@
 export { defineConfig } from './config.ts';
 export type { CheckFn, Config, Environment, Known, Role } from './config.ts';
 export type { ExpectAssertion, Phase, PhaseStart, Scenario } from './scenario.ts';
-export { RUN_PLACEHOLDER } from './scenario.ts';
+export { RUN_PLACEHOLDER, hintedTarget } from './scenario.ts';

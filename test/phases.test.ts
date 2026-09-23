@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Config } from '../src/config.ts';
 import { flattenInputs, maskDeep, maskSecrets } from '../src/runner.ts';
-import { applyRunId, loadScenarios, newRunId, RUN_PLACEHOLDER, scenarioInputs, scenarioPhases, type Scenario } from '../src/scenario.ts';
+import { applyRunId, hintedTarget, loadScenarios, newRunId, RUN_PLACEHOLDER, scenarioInputs, scenarioPhases, type Scenario } from '../src/scenario.ts';
 import { decideVerdict } from '../src/verdict.ts';
 
 test('newRunId: short, lowercase alphanumeric, unique across calls', () => {
@@ -113,6 +113,31 @@ test('applyRunId: a phase name is left alone too (it tags results and must never
   assert.equal(out.then![0].name, 'phase {{run}}');
   assert.equal(out.then![0].start, '/b?r=zz');
   assert.equal(out.then![0].goal, 'h zz');
+});
+
+test('hintedTarget: picks the offered fill target by label substring or /regex/, ignores clicks and bad regexes', () => {
+  const actions = [
+    { kind: 'click', label: 'ZIP Code (Required)' },
+    { kind: 'fill', label: 'Country (Required)' },
+    { kind: 'fill', label: 'ZIP Code (Required)' },
+    { kind: 'click', label: 'Open ZIP Code (Required)' },
+    { kind: 'fill', label: 'Card number', frame: 1 },
+  ];
+  assert.equal(hintedTarget('zip code', actions), actions[2]);
+  assert.equal(hintedTarget('/^country/i', actions), actions[1]);
+  assert.equal(hintedTarget('/card number/i', actions), actions[4], 'frame-hosted targets count');
+  assert.equal(hintedTarget('nothing like it', actions), undefined);
+  assert.equal(hintedTarget('/[/', actions), undefined, 'a broken regex hints nothing');
+  assert.equal(hintedTarget(undefined, actions), undefined);
+});
+
+test('loadScenarios: inputFields must name existing inputs, on the scenario and on a phase', () => {
+  const config = configWith({});
+  const [ok] = load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { zip: '1' }, inputFields: { zip: 'ZIP' }, expect: [{ text: 'a' }], then: [{ start: '/b', goal: 'h', inputs: { pw: 'p' }, inputFields: { pw: '/pass/i' } }] }, config);
+  assert.deepEqual(ok.inputFields, { zip: 'ZIP' });
+  assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { zip: '1' }, inputFields: { nope: 'ZIP' }, expect: [{ text: 'a' }] }, config), /inputFields names "nope"/);
+  assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', inputs: { zip: '1' }, inputFields: { zip: '' }, expect: [{ text: 'a' }] }, config), /inputFields must be an object of non-empty strings/);
+  assert.throws(() => load({ name: 'acceptance/x', role: null, start: '/', goal: 'g', expect: [{ text: 'a' }], then: [{ start: '/b', goal: 'h', inputFields: { pw: 'x' } }] }, config), /then\[0\]\.inputFields names "pw"/);
 });
 
 test('scenarioInputs: every key with every value it had across the scenario and its phases', () => {

@@ -24,6 +24,7 @@ export type Phase = {
   start: PhaseStart;
   goal: string;
   inputs?: Record<string, string>;
+  inputFields?: Record<string, string>;
   maxSteps?: number;
   expect?: ExpectAssertion[];
 };
@@ -35,6 +36,12 @@ export type Scenario = {
   start: string;
   goal: string;
   inputs?: Record<string, string>;
+  // Binds an input key to the FIELD it belongs in, by label: a case-insensitive substring, or a
+  // /regex/. Jev still decides when to type and which input; the engine then types it into the
+  // offered fill target whose label matches, whatever target Jev named. On a long form Jev's
+  // target and input choices are made independently and drift (the postcode into the country
+  // field); a hint makes that pairing deterministic. Unmatched hints fall back to Jev's target.
+  inputFields?: Record<string, string>;
   maxSteps?: number;
   expect?: ExpectAssertion[];
   mutates?: boolean;
@@ -100,7 +107,7 @@ export function scenarioInputs(s: Pick<Scenario, 'inputs' | 'then'>): Record<str
 // (named "then #n" when unnamed).
 export function scenarioPhases(s: Scenario): (Phase & { name: string })[] {
   return [
-    { name: 'main', start: s.start, goal: s.goal, inputs: s.inputs, maxSteps: s.maxSteps, expect: s.expect },
+    { name: 'main', start: s.start, goal: s.goal, inputs: s.inputs, inputFields: s.inputFields, maxSteps: s.maxSteps, expect: s.expect },
     ...(s.then ?? []).map((p, i) => ({ ...p, name: p.name ?? `then #${i + 1}` })),
   ];
 }
@@ -141,6 +148,30 @@ function validateInputs(file: string, scenarioName: string, inputs: unknown, whe
   if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputs must be an object of string values`);
 }
 
+function validateInputFields(file: string, scenarioName: string, fields: unknown, inputs: unknown, where: string): void {
+  const ok = fields && typeof fields === 'object' && !Array.isArray(fields) && Object.values(fields as object).every((v) => typeof v === 'string' && v.length > 0);
+  if (!ok) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputFields must be an object of non-empty strings (a label substring or /regex/ per input key)`);
+  const known = new Set(Object.keys((inputs as object) ?? {}));
+  for (const k of Object.keys(fields as object)) {
+    if (!known.has(k)) throw new Error(`${file}: scenario "${scenarioName}"${where}.inputFields names "${k}", which is not one of its inputs`);
+  }
+}
+
+// PURE: the offered fill target a hint selects for an input key, if any — label match by
+// case-insensitive substring, or by regex when written /…/flags. Frame-hosted targets count.
+export function hintedTarget<A extends { kind: string; label: string }>(hint: string | undefined, actions: A[]): A | undefined {
+  if (!hint) return undefined;
+  const m = /^\/(.*)\/([a-z]*)$/.exec(hint);
+  let test: (label: string) => boolean;
+  try {
+    const re = m ? new RegExp(m[1], m[2]) : null;
+    test = re ? (l) => re.test(l) : (l) => l.toLowerCase().includes(hint.toLowerCase());
+  } catch {
+    return undefined; // a broken /regex/ hints nothing
+  }
+  return actions.find((a) => a.kind === 'fill' && test(a.label.split(' → ')[0]));
+}
+
 function validatePhases(file: string, scenarioName: string, then: unknown, config: Config): asserts then is Phase[] {
   if (!Array.isArray(then)) throw new Error(`${file}: scenario "${scenarioName}".then must be an array of phases`);
   then.forEach((p, i) => {
@@ -167,6 +198,7 @@ function validatePhases(file: string, scenarioName: string, then: unknown, confi
     }
     if (ph.expect !== undefined) validateExpect(file, `${scenarioName}${where}`, ph.expect);
     if (ph.inputs !== undefined) validateInputs(file, scenarioName, ph.inputs, where);
+    if (ph.inputFields !== undefined) validateInputFields(file, scenarioName, ph.inputFields, ph.inputs, where);
     if (ph.maxSteps !== undefined && typeof ph.maxSteps !== 'number') {
       throw new Error(`${file}: scenario "${scenarioName}"${where}.maxSteps must be a number when present`);
     }
@@ -193,6 +225,7 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
   }
   if (sc.expect !== undefined) validateExpect(file, sc.name, sc.expect);
   if (sc.inputs !== undefined) validateInputs(file, sc.name, sc.inputs, '');
+  if (sc.inputFields !== undefined) validateInputFields(file, sc.name, sc.inputFields, sc.inputs, '');
   if (sc.then !== undefined) validatePhases(file, sc.name, sc.then, config);
   if (sc.secretInputs !== undefined) {
     const known = new Set([
