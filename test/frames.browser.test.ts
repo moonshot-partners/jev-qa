@@ -27,6 +27,9 @@ ${overlay ? '<div id="overlay" style="position:fixed;left:0;top:0;width:100%;hei
 <div style="height:1200px"></div>
 </body></html>`;
 
+// 998 characters (6 copies + separators end 6 short of the cap), distinctive in every 6-character window (no repeats of the head).
+const ECHO_SECRET = 'Kq7Zw!' + Array.from({ length: 992 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('');
+
 const INNER_HTML = `<!doctype html>
 <html><head><title>inner</title></head><body>
 <label for="card">Card number</label>
@@ -43,6 +46,7 @@ async function fixture(): Promise<{ server: Server; base: string }> {
     res.writeHead(200, { 'content-type': 'text/html' });
     if (path === '/inner') res.end(INNER_HTML);
     else if (path === '/covered') res.end(OUTER_HTML(true));
+    else if (path === '/echo') res.end('<!doctype html><html><body>' + Array.from({ length: 7 }, () => '<p>' + ECHO_SECRET + '</p>').join('') + '</body></html>');
     else if (path === '/mid') res.end('<!doctype html><html><body><iframe id="m" src="/inner" style="width:380px;height:180px;border:0"></iframe></body></html>');
     else if (path === '/nested-covered') res.end('<!doctype html><html><body><iframe id="o" src="/mid" style="width:420px;height:220px;border:0"></iframe><div id="overlay" style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:10;background:rgba(0,0,0,0.01)"></div></body></html>');
     else if (path === '/scaled') res.end('<!doctype html><html><body><iframe id="s" src="/inner" style="width:400px;height:200px;border:0;transform:scale(0.5);transform-origin:0 0"></iframe></body></html>');
@@ -236,6 +240,49 @@ test('frames: a CSS-scaled frame is not offered for input', { skip: SKIP }, asyn
     await page.waitForTimeout(500);
     const obs = await observe(page);
     assert.equal(obs.actions.filter((a) => a.label === 'Card number' || a.label === 'Pay').length, 0, 'controls inside a scaled frame are not listed');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+
+// Round 10 (P1): the snapshot keeps only WHOLE text nodes — a node cut at the 6,000-character
+// cap could leave a secret prefix too short for any redaction to recognise.
+test('snapshot: page text never ends in a partial node (no unredactable secret prefix)', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 4000 } });
+    await page.goto(base + '/echo');
+    const obs = await observe(page);
+    assert.ok(obs.text.length <= 6000);
+    const { body } = buildBody(obs, 'goal', { password: ECHO_SECRET }, [], new Set(), [ECHO_SECRET]);
+    assert.ok(!JSON.stringify(body).includes(ECHO_SECRET.slice(0, 6)), 'no fragment of the secret reaches the decision API');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+// Round 10 (P2): ANY non-translation transform (a mirror keeps the box size) refuses the frame.
+test('frames: a mirrored frame (scaleX(-1)) is not offered; a translated one still is', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    await page.setContent('<iframe src="' + base + '/inner" style="width:400px;height:200px;border:0;transform:scaleX(-1)"></iframe>');
+    await page.waitForTimeout(500);
+    let obs = await observe(page);
+    assert.equal(obs.actions.filter((a) => a.label === 'Card number').length, 0, 'mirrored: not offered');
+    await page.setContent('<iframe src="' + base + '/inner" style="width:400px;height:200px;border:0;transform:translate(30px,10px)"></iframe>');
+    await page.waitForTimeout(500);
+    obs = await observe(page);
+    assert.equal(obs.actions.filter((a) => a.label === 'Card number' && a.kind === 'fill').length, 1, 'translated: still offered');
     await page.close();
   } finally {
     await browser?.close();

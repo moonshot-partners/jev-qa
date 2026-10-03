@@ -242,7 +242,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       await loginPage.close();
     }
     page = await ctx.newPage();
-    const detach = watch(page, sink, () => reportStep, { ownOrigins: config.ownOrigins, noise: config.noise, known: config.known });
+    const detach = watch(page, sink, () => reportStep, { ownOrigins: config.ownOrigins, noise: config.noise, known: config.known, mask });
     await page.goto(s.start.startsWith('http') ? s.start : baseUrl + s.start, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
     await config.beforeEach?.(page);
@@ -346,7 +346,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       reportStep = step;
       const obs: Observation = await observe(page);
       const crash = crashText.find((re) => re.test(obs.text));
-      if (crash) record(sink, obs.url, step, 'crash-screen', crash.source, { noise: config.noise, known: config.known });
+      if (crash) record(sink, obs.url, step, 'crash-screen', crash.source, { noise: config.noise, known: config.known, mask });
       const certified = certifiedKeys();
       const d: Decision = await decide(obs, phase.goal, phaseInputs, history, certified, phaseSecrets, pseudonyms);
       jevMs += d.latencyMs;
@@ -673,7 +673,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       if (finalObs) {
         finalText = mask(finalObs.text).slice(0, 1_500); // mask BEFORE clipping: a clip can cut a secret in two
         const finalCrash = crashText.find((re) => re.test(finalObs.text));
-        if (finalCrash) record(sink, finalObs.url, lastExecutedStep, 'crash-screen', finalCrash.source, { noise: config.noise, known: config.known });
+        if (finalCrash) record(sink, finalObs.url, lastExecutedStep, 'crash-screen', finalCrash.source, { noise: config.noise, known: config.known, mask });
       }
     };
     await checkFinalCrash();

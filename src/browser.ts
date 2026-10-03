@@ -48,18 +48,47 @@ async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
         const cs = getComputedStyle(e as Element);
         const px = (v: string) => parseFloat(v) || 0;
         const h = e as HTMLElement;
-        return { l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom), ow: h.offsetWidth, oh: h.offsetHeight };
+        // Round 10 (P2): any transform other than a pure translation, on the iframe or any
+        // ancestor in its document (a mirror keeps the box size, so the size test alone misses it).
+        let warped = false;
+        for (let x: Element | null = e as Element; x; x = x.parentElement) {
+          const s = getComputedStyle(x);
+          const t = s.transform;
+          const m = /^matrix\(([^)]*)\)$/.exec(t);
+          const m3 = /^matrix3d\(([^)]*)\)$/.exec(t);
+          const pure2 = m && (() => { const [a, b, c, d] = m[1].split(',').map(Number); return a === 1 && b === 0 && c === 0 && d === 1; })();
+          const pure3 = m3 && (() => { const v = m3[1].split(',').map(Number); return [0, 5, 10, 15].every((i) => v[i] === 1) && [1, 2, 3, 4, 6, 7, 8, 9, 11].every((i) => v[i] === 0); })();
+          if ((t && t !== 'none' && !pure2 && !pure3) || (s.scale && s.scale !== 'none') || (s.rotate && s.rotate !== 'none') || ((s as any).zoom && !['1', 'normal', ''].includes(String((s as any).zoom)))) warped = true;
+        }
+        return { warped, l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom), ow: h.offsetWidth, oh: h.offsetHeight };
       })
       .catch(() => null);
     // Round 9 (P2): frame-local coordinates are added to the frame's on-page box unscaled, so a
     // CSS-transformed frame (its own, or an ancestor's: scale, rotate) would put the click on a
     // different control while every hit test still passes. Its on-page size then differs from
     // its untransformed layout size — refuse such a frame instead of guessing.
-    if (!inset || Math.abs(box.width - inset.ow) > 1 || Math.abs(box.height - inset.oh) > 1) return null;
+    if (!inset || inset.warped || Math.abs(box.width - inset.ow) > 1 || Math.abs(box.height - inset.oh) > 1) return null;
+    // A nested frame inherits every ancestor frame's geometry: refuse it when any ancestor is refused.
+    const parent = frame.parentFrame();
+    if (parent && parent !== frame.page().mainFrame() && !(await frameBox(parent))) return null;
     return { x: box.x + inset.l, y: box.y + inset.t, w: Math.max(0, box.width - inset.l - inset.r), h: Math.max(0, box.height - inset.t - inset.b) };
   } finally {
     await el.dispose().catch(() => {});
   }
+}
+
+// Round 10 (P1): joins lines up to `max` characters WITHOUT cutting one — a cut line could
+// leave a secret prefix too short for any redaction to recognise.
+function fitWholeLines(lines: string[], max: number): string {
+  const out: string[] = [];
+  let length = 0;
+  for (const line of lines) {
+    const add = line.length + (out.length ? 1 : 0);
+    if (length + add > max) continue;
+    out.push(line);
+    length += add;
+  }
+  return out.join('\n');
 }
 
 // Merges every child frame's snapshot into the main observation: actions get `frame` + page
@@ -98,7 +127,7 @@ async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promi
   }
   elements.forEach((a, i) => (a.id = 'e' + (i + 1)));
   obs.actions = [...elements, ...controls];
-  if (texts.length) obs.text = [obs.text, ...texts].filter(Boolean).join('\n').slice(0, 6000);
+  if (texts.length) obs.text = fitWholeLines([obs.text, ...texts].filter(Boolean).join('\n').split('\n'), 6000);
 }
 
 export async function observe(page: Page): Promise<Observation> {

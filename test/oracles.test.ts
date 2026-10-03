@@ -236,3 +236,29 @@ test('record keeps the full detail; clipping happens after masking', () => {
   record(sink, 'https://a.test/', 1, 'console.error', detail, {});
   assert.equal(sink.findings[0].detail.length, 600);
 });
+
+
+// Round 10 (P1): with a mask, record() masks BEFORE its 20k bound, so repeated copies of a long
+// secret cannot leave a prefix at the boundary.
+test('record masks at capture time when given a mask', () => {
+  const sink = newSink();
+  const secret = 'Zx9!' + 'q'.repeat(1995); // 1,999 characters
+  const detail = Array.from({ length: 15 }, () => secret).join(' ');
+  record(sink, 'https://a.test/', 1, 'console.error', detail, { mask: (t: string) => t.split(secret).join('«password»') });
+  assert.ok(!sink.findings[0].detail.includes('Zx9!'), 'no fragment of the secret is stored');
+});
+
+// Round 10 (P1): a response belongs to the step of its REQUEST, not the step it arrived in — a
+// slow request from an earlier phase must not land in a later phase's evidence window.
+test("watch: a late response keeps its request's step", () => {
+  const emitter = new EventEmitter();
+  const page = Object.assign(emitter, { url: () => "https://example.com/x" }) as unknown as Page;
+  const sink = newSink();
+  let current = 3;
+  watch(page, sink, () => current, { ownOrigins: [/example\.com/] });
+  const req = fakeRequest("https://example.com/api/slow", { method: "GET" });
+  emitter.emit("request", req);
+  current = 9; // the next phase has started when the response arrives
+  emitter.emit("response", { url: () => "https://example.com/api/slow", status: () => 200, headers: () => ({ "content-type": "text/plain" }), request: () => req });
+  assert.equal(sink.responses[0].step, 3);
+});

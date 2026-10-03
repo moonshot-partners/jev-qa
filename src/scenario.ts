@@ -259,6 +259,21 @@ function validateScenario(file: string, s: unknown, config: Config): asserts s i
     throw new Error(`${file}: scenario "${sc.name}" has kind "acceptance" but no expect assertions (acceptance scenarios need at least one expect entry, on the scenario or on a phase, or they can never do more than reach Jev DONE unverified)`);
   }
   const phaseInputs = ((sc.then as Phase[] | undefined) ?? []).some((p) => p.inputs && Object.keys(p.inputs).length > 0);
+  // Round 10 (P1): input certification is value-based, so two keys of one phase that share a value
+  // could be certified by a single request — refuse that instead of over-certifying.
+  if (kind === 'adversarial') {
+    const phasesInputs = [sc.inputs, ...((Array.isArray(sc.then) ? sc.then : []) as { inputs?: unknown }[]).map((p) => ({ ...((sc.inputs as object) ?? {}), ...((p?.inputs as object) ?? {}) }))];
+    for (const inputs of phasesInputs) {
+      if (!inputs || typeof inputs !== 'object') continue;
+      const byValue = new Map<string, string>();
+      for (const [k, v] of Object.entries(inputs as Record<string, unknown>)) {
+        if (typeof v !== 'string') continue;
+        const other = byValue.get(v);
+        if (other !== undefined && other !== k) throw new Error(`${file}: scenario "${sc.name}" inputs "${other}" and "${k}" share the value — an adversarial run cannot tell which one was submitted; give each input its own value`);
+        byValue.set(v, k);
+      }
+    }
+  }
   if (kind === 'adversarial' && (!sc.inputs || typeof sc.inputs !== 'object' || Array.isArray(sc.inputs) || Object.keys(sc.inputs as object).length === 0) && !phaseInputs) {
     throw new Error(`${file}: scenario "${sc.name}" has kind "adversarial" but has no inputs (adversarial scenarios need at least one hostile input to submit, on the scenario or on a phase)`);
   }
