@@ -99,6 +99,7 @@ async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promi
   const controls = obs.actions.filter((a) => a.node === undefined);
   const elements = obs.actions.filter((a) => a.node !== undefined);
   const texts: string[] = [];
+  const crashes: string[] = [];
   const vw = obs.w ?? Infinity;
   const vh = obs.h ?? Infinity;
   for (const frame of page.frames()) {
@@ -124,10 +125,13 @@ async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promi
       elements.push({ ...a, frame: index, rect });
     }
     if (sub.text) texts.push(sub.text);
+    // Round 12 (P1): a crash shown only inside a frame must reach the crash check too.
+    if (sub.crash_text) crashes.push(sub.crash_text);
   }
   elements.forEach((a, i) => (a.id = 'e' + (i + 1)));
   obs.actions = [...elements, ...controls];
   if (texts.length) obs.text = fitWholeParts([obs.text, ...texts].filter(Boolean), 6000);
+  if (crashes.length) obs.crash_text = [obs.crash_text ?? '', ...crashes].filter(Boolean).join('\n').slice(0, 200_000);
 }
 
 export async function observe(page: Page): Promise<Observation> {

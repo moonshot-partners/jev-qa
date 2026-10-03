@@ -53,6 +53,7 @@ async function fixture(): Promise<{ server: Server; base: string }> {
     else if (path === '/bigcrash') res.end('<!doctype html><html><body><p>' + 'x'.repeat(3500) + ' Application error: a client-side exception has occurred ' + 'y'.repeat(3500) + '</p></body></html>');
     else if (path === '/mlframe') res.end('<!doctype html><html><body><p>' + 'm'.repeat(2500) + '</p><iframe src="/mlsecret" style="width:600px;height:300px;border:0"></iframe></body></html>');
     else if (path === '/mlsecret') res.end('<!doctype html><html><body><pre>' + ML_SECRET + '</pre></body></html>');
+    else if (path === '/framecrash') res.end('<!doctype html><html><body><h1>Shop</h1><iframe src="/bigcrash" style="width:600px;height:400px;border:0"></iframe></body></html>');
     else if (path === '/mid') res.end('<!doctype html><html><body><iframe id="m" src="/inner" style="width:380px;height:180px;border:0"></iframe></body></html>');
     else if (path === '/nested-covered') res.end('<!doctype html><html><body><iframe id="o" src="/mid" style="width:420px;height:220px;border:0"></iframe><div id="overlay" style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:10;background:rgba(0,0,0,0.01)"></div></body></html>');
     else if (path === '/scaled') res.end('<!doctype html><html><body><iframe id="s" src="/inner" style="width:400px;height:200px;border:0;transform:scale(0.5);transform-origin:0 0"></iframe></body></html>');
@@ -330,6 +331,26 @@ test('frames: a multi-line secret in a frame is never partly forwarded', { skip:
     const obs = await observe(page);
     const { body } = buildBody(obs, 'goal', { secret: ML_SECRET }, [], new Set(), [ML_SECRET]);
     assert.ok(!JSON.stringify(body).includes('Wv3!pQ9#zT'), 'the first line of the secret is not forwarded');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+
+// Round 12 (P1): a frame's crash sample joins the page's — a crash shown only inside an iframe,
+// in one huge text node, must still reach the crash check.
+test('frames: a crash shown inside a frame reaches the crash check', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 1200 } });
+    await page.goto(base + '/framecrash');
+    await page.waitForTimeout(500);
+    const obs = await observe(page);
+    assert.match(obs.crash_text ?? '', /application error/i);
     await page.close();
   } finally {
     await browser?.close();
