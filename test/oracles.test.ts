@@ -226,3 +226,13 @@ test('drainPending: an unresolved promise is left in sink.pending for a later at
   assert.equal(sink.pending.length, 1);
   assert.equal(sink.pending[0], stuck); // carried forward, not discarded
 });
+
+
+// Round 9 (P1): record() must not clip before the runner masks — a secret straddling the clip
+// boundary would survive as an unmaskable prefix.
+test('record keeps the full detail; clipping happens after masking', () => {
+  const sink = newSink();
+  const detail = 'x'.repeat(600);
+  record(sink, 'https://a.test/', 1, 'console.error', detail, {});
+  assert.equal(sink.findings[0].detail.length, 600);
+});

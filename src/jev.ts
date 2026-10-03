@@ -135,6 +135,22 @@ function formEncode(percentEncoded: string): string {
   return percentEncoded.replace(/[!'()*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
 }
 
+// Round 9 (P1): what a browser's form submission ACTUALLY sends — the WHATWG
+// application/x-www-form-urlencoded byte serializer: `*-._` and alphanumerics stay literal, a
+// space becomes `+`, every other UTF-8 byte is %XX (uppercase). Note `*` stays LITERAL here,
+// unlike formEncode() above, which mirrors PHP-style urlencode (`%2A`) and is kept for servers
+// that echo a value that way.
+function whatwgFormEncode(value: string): string {
+  let out = '';
+  for (const byte of new TextEncoder().encode(value)) {
+    const c = String.fromCharCode(byte);
+    if (/[A-Za-z0-9*\-._]/.test(c)) out += c;
+    else if (byte === 0x20) out += '+';
+    else out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return out;
+}
+
 // Every string form a hostile input value could survive as by the time it's embedded somewhere
 // in the outgoing request — the full search list redact() below replaces with «key». Exported
 // and unit-tested directly (round 7, M2): a real GET-form submission's encoding was the exact
@@ -146,12 +162,14 @@ export function redactionForms(value: string): string[] {
   const percentLower = percentUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const formUpper = formEncode(percentUpper); // application/x-www-form-urlencoded — a real GET/POST form
   const formLower = formUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+  const whatwgUpper = whatwgFormEncode(value); // what a real browser <form> submission sends
+  const whatwgLower = whatwgUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const htmlNamed = escapeHtml(value); // &amp; &lt; &gt; &quot; &#39;
   const htmlDecimal = numericEntity(value, (code) => `&#${code};`);
   const htmlHex = numericEntity(value, (code) => `&#x${code.toString(16)};`);
   const jsonPlain = JSON.stringify(value).slice(1, -1); // quotes/backslashes/controls only
   const jsonAscii = jsonAsciiEscape(value); // every non-ASCII char \uXXXX too (astral as a surrogate pair)
-  return [value, percentUpper, percentLower, formUpper, formLower, htmlNamed, htmlDecimal, htmlHex, jsonPlain, jsonAscii];
+  return [value, percentUpper, percentLower, formUpper, formLower, whatwgUpper, whatwgLower, htmlNamed, htmlDecimal, htmlHex, jsonPlain, jsonAscii];
 }
 
 function escapeRegExp(s: string): string {

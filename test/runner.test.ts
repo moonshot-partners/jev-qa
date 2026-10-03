@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { RequestRecord, ResponseRecord } from '../src/oracles.ts';
-import { capRecent, persistedTimeline } from '../src/runner.ts';
+import { capRecent, certifiedInputKeys, flattenInputEntries, maskSecrets, persistFinding, persistedTimeline } from '../src/runner.ts';
 
 // --- round 10 (Q3): capRecent — results.json persistence cap -----------------------------------
 
@@ -77,4 +77,37 @@ test('persistedTimeline: at or under the cap nothing is omitted and the omitted 
   assert.equal(t.requestsOmitted, undefined);
   assert.equal(t.responsesOmitted, undefined);
   assert.equal('requestsOmitted' in JSON.parse(JSON.stringify(t)), false, 'undefined omitted counts never reach results.json');
+});
+
+
+// Round 9 (P1): a finding is masked BEFORE it is clipped to 400 characters.
+test('persistFinding masks then clips, so no secret prefix survives the boundary', () => {
+  const secret = 'Pw-0123456789AB'; // 15 characters
+  const detail = 'e'.repeat(387) + secret + ' tail';
+  const s = { inputs: { password: secret }, secretInputs: ['password'] } as any;
+  const out = persistFinding({ kind: 'console.error', detail, url: 'https://a.test/', step: 1 }, (t: string) => maskSecrets(t, s));
+  assert.ok(out.detail.length <= 400);
+  assert.ok(!out.detail.includes(secret.slice(0, 13)), out.detail.slice(380));
+});
+
+// Round 9 (P1): certification is per phase AND key — a value submitted in one phase never
+// certifies a different key that only a later phase offers.
+test('certifiedInputKeys: an earlier phase cannot certify a later phase key with the same value', () => {
+  const entries = flattenInputEntries({ first: ['same-value'], second: ['same-value'] });
+  const windows: { inputs: Record<string, string>; values: Set<string> }[] = [
+    { inputs: { first: 'same-value' }, values: new Set(['same-value']) },
+    { inputs: { second: 'same-value' }, values: new Set<string>() },
+  ];
+  const certified = certifiedInputKeys(entries, windows);
+  assert.ok(certified.has('first'));
+  assert.ok(!certified.has('second'));
+});
+
+test('certifiedInputKeys: a main-phase key inherited by a later phase is certified by either window', () => {
+  const entries = flattenInputEntries({ email: ['a@x.test'] });
+  const windows: { inputs: Record<string, string>; values: Set<string> }[] = [
+    { inputs: { email: 'a@x.test' }, values: new Set<string>() },
+    { inputs: { email: 'a@x.test' }, values: new Set(['a@x.test']) },
+  ];
+  assert.ok(certifiedInputKeys(entries, windows).has('email'));
 });

@@ -135,8 +135,30 @@ async function evalOne(a: ExpectAssertion, state: ExpectState): Promise<ExpectRe
   return { assertion: a, ok: result.ok, expected: `check "${name}" ok`, actual: result.detail };
 }
 
-export async function evaluate(assertions: ExpectAssertion[], state: ExpectState): Promise<ExpectResult[]> {
+// Round 9 (P2): a pure assertion AFTER a check may describe what the check started (an
+// asynchronous page update), so with a settle window it is polled until it holds or the window
+// passes. Pure assertions before the first check were already settled (settleExpectations), and
+// a check itself is never re-run — it may act.
+export async function evaluate(
+  assertions: ExpectAssertion[],
+  state: ExpectState,
+  opts: { settleMs?: number; intervalMs?: number } = {},
+): Promise<ExpectResult[]> {
+  const settleMs = opts.settleMs ?? 0;
+  const intervalMs = opts.intervalMs ?? 250;
   const results: ExpectResult[] = [];
-  for (const a of assertions) results.push(await evalOne(a, state));
+  let afterCheck = false;
+  for (const a of assertions) {
+    let r = await evalOne(a, state);
+    if (!isPureAssertion(a)) afterCheck = true;
+    else if (afterCheck && !r.ok && settleMs > 0) {
+      const started = Date.now();
+      while (!r.ok && Date.now() - started < settleMs) {
+        await new Promise((res) => setTimeout(res, intervalMs));
+        r = await evalOne(a, state);
+      }
+    }
+    results.push(r);
+  }
   return results;
 }

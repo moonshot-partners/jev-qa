@@ -43,6 +43,9 @@ async function fixture(): Promise<{ server: Server; base: string }> {
     res.writeHead(200, { 'content-type': 'text/html' });
     if (path === '/inner') res.end(INNER_HTML);
     else if (path === '/covered') res.end(OUTER_HTML(true));
+    else if (path === '/mid') res.end('<!doctype html><html><body><iframe id="m" src="/inner" style="width:380px;height:180px;border:0"></iframe></body></html>');
+    else if (path === '/nested-covered') res.end('<!doctype html><html><body><iframe id="o" src="/mid" style="width:420px;height:220px;border:0"></iframe><div id="overlay" style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:10;background:rgba(0,0,0,0.01)"></div></body></html>');
+    else if (path === '/scaled') res.end('<!doctype html><html><body><iframe id="s" src="/inner" style="width:400px;height:200px;border:0;transform:scale(0.5);transform-origin:0 0"></iframe></body></html>');
     else if (path === '/sibling') res.end(OUTER_HTML(false).replace('<div style="height:1200px"></div>', '<iframe id="g" src="/inner" style="position:absolute;left:0;top:0;width:100%;height:100%;border:0;opacity:0.01"></iframe><div style="height:1200px"></div>'));
     else res.end(OUTER_HTML(false));
   });
@@ -190,6 +193,49 @@ test('password fields: offered by name as fillable, value never read, and a scen
     assert.equal(await page.evaluate(() => (document.getElementById('pw') as HTMLInputElement).value), inputs.password, 'the input value was typed into the password field');
     const after = await observe(page);
     assert.equal(JSON.stringify(after).includes(inputs.password), false, 'still never read back after typing');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+
+// Round 9 (P2): the occlusion check walks EVERY frame level up to the main document — an overlay
+// over the OUTER frame of a nested pair must refuse the input, not receive the click.
+test('frames: a nested-frame target is refused when the main document covers its outer frame', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    await page.goto(base + '/nested-covered');
+    await page.waitForTimeout(500);
+    const inner = page.frames().find((f) => f.url().endsWith('/inner'))!;
+    const obs = await observe(page);
+    const card = obs.actions.find((a) => a.label === 'Card number' && a.kind === 'fill');
+    assert.ok(card, 'listed: no frame-side snapshot can see the main-document overlay');
+    await assert.rejects(() => act(page, card!, '4242'), /occluded/);
+    assert.equal(await inner.evaluate(() => (document.getElementById('card') as HTMLInputElement).value), '', 'nothing was typed');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+// Round 9 (P2): a CSS-scaled frame would translate frame-local coordinates wrongly (the click
+// could land on a different control while both hit tests pass) — such a frame is not offered.
+test('frames: a CSS-scaled frame is not offered for input', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    await page.goto(base + '/scaled');
+    await page.waitForTimeout(500);
+    const obs = await observe(page);
+    assert.equal(obs.actions.filter((a) => a.label === 'Card number' || a.label === 'Pay').length, 0, 'controls inside a scaled frame are not listed');
     await page.close();
   } finally {
     await browser?.close();

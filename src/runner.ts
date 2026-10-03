@@ -83,19 +83,47 @@ export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 
   return out;
 }
 
+// PURE: a finding as it leaves the run — masked FIRST, then clipped to 400 characters, so a
+// secret that straddles the clip boundary is replaced whole instead of surviving as a prefix.
+export function persistFinding(f: Finding, mask: (s: string) => string): Finding {
+  return { ...f, detail: mask(f.detail).slice(0, 400), url: mask(f.url) };
+}
+
+// PURE: the flattened inputs with the original key each name came from (`key#2` → `key`).
+export function flattenInputEntries(byKey: Record<string, string[]>): { name: string; key: string; value: string }[] {
+  const out: { name: string; key: string; value: string }[] = [];
+  const taken = new Set<string>();
+  for (const [k, vs] of Object.entries(byKey)) {
+    vs.forEach((v, i) => {
+      let name = i ? `${k}#${i + 1}` : k;
+      for (let n = i + 1; taken.has(name) || (name !== k && name in byKey); n++) name = `${k}#${n + 1}`;
+      taken.add(name);
+      out.push({ name, key: k, value: v });
+    });
+  }
+  return out;
+}
+
+// PURE (round 9, P1): which flattened input names count as submitted. An input is certified only
+// by a phase that OFFERS that key with that value and whose own evidence window carries the
+// value — so a value one phase submitted never certifies a different key, or a later phase's
+// key, that happens to share it.
+export function certifiedInputKeys(
+  entries: { name: string; key: string; value: string }[],
+  windows: { inputs: Record<string, string>; values: Set<string> }[],
+): Set<string> {
+  const out = new Set<string>();
+  for (const e of entries) {
+    if (windows.some((w) => w.inputs[e.key] === e.value && w.values.has(e.value))) out.add(e.name);
+  }
+  return out;
+}
+
 // PURE: every input across every phase, flattened for the verdict's "each input reached the
 // server" rule: a key reused with a second value in a later phase appears again as `key#2`
 // (`#3`, … — skipping any name a real input already uses).
 export function flattenInputs(byKey: Record<string, string[]>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, vs] of Object.entries(byKey)) {
-    vs.forEach((v, i) => {
-      let name = i ? `${k}#${i + 1}` : k;
-      for (let n = i + 1; name in out || (name !== k && name in byKey); n++) name = `${k}#${n + 1}`;
-      out[name] = v;
-    });
-  }
-  return out;
+  return Object.fromEntries(flattenInputEntries(byKey).map((e) => [e.name, e.value]));
 }
 
 // PURE: applies a string mask to every string inside plain JSON-shaped data (an expectation's
@@ -199,6 +227,8 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
   // of the phases' own windows, so a later phase's start request (or any traffic of its own)
   // can never certify a fill an earlier phase made and never submitted.
   const phaseRanges: [number, number][] = [];
+  const phaseOffered: Record<string, string>[] = []; // round 9: each executed phase's own inputs
+  let certified: Set<string> | undefined;
   let findings: Finding[] = [];
   let responses: ResponseRecord[] = [];
   let requests: RequestRecord[] = [];
@@ -681,13 +711,14 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       if (settledIn >= EXPECT_SETTLE_MS) trail[trail.length - 1].label += ` (expectations not settled after ${Math.round(EXPECT_SETTLE_MS / 1000)}s)`;
       else if (settledIn > 1_500) trail[trail.length - 1].label += ` (expectations settled after ${(settledIn / 1000).toFixed(1)}s)`;
       await drainPending(sink, 5, 3_000);
-      const results = await evaluate(phase.expect, expectState);
+      const results = await evaluate(phase.expect, expectState, { settleMs: EXPECT_SETTLE_MS });
       // A `check` assertion can navigate to a crash screen; catch it now, not just before.
       await checkFinalCrash();
       for (const r of results) allExpect.push(phaseLabel ? { ...r, phase: phaseLabel } : r);
       phaseFailed = results.some((r) => !r.ok);
     }
     phaseRanges.push([phaseFirstStep, step]);
+    phaseOffered.push(phaseInputs);
     if (phaseLabel && !jevDone) loopReason = `phase "${phase.name}": ${loopReason}`;
     // The next phase runs only on a clean hand-over: Jev DONE here, every expectation met.
     if (!jevDone || phaseFailed) break;
@@ -718,14 +749,19 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     ];
     submitted = new Set<string>();
     const ranges = phaseRanges.length ? phaseRanges : [[0, Number.MAX_SAFE_INTEGER] as [number, number]];
-    for (const [from, to] of ranges) for (const v of submittedInputs(finalEvents.filter((e) => e.step >= from && e.step <= to))) submitted.add(v);
+    const windows = ranges.map(([from, to], i) => {
+      const values = submittedInputs(finalEvents.filter((e) => e.step >= from && e.step <= to));
+      for (const v of values) submitted.add(v);
+      return { inputs: phaseOffered[i] ?? allInputs, values: new Set(values) };
+    });
+    certified = certifiedInputKeys(flattenInputEntries(scenarioInputs(s)), windows);
     // N4/N5b (round 8): for any adversarial input that never got fully certified, note when
     // there's a more specific reason than "nothing happened at all" — a PARTIAL prefix match
     // first (checked first: it's the more actionable, and the more likely, of the two — real
     // apps truncate long inputs far more often than they send an uninspectable body), else a
     // PLAUSIBLE-but-unconfirmable request. The BLOCKED reason can then say so specifically.
     for (const [k, v] of Object.entries(allInputs)) {
-      if (submitted.has(v)) continue;
+      if (certified.has(k)) continue;
       const partial = partialMatch(finalEvents, v);
       if (partial) {
         missingDetail[k] = mask(`partial match: ${partial.prefixLength} of ${v.length} characters (via ${partial.request.method} ${partial.request.url})`);
@@ -750,7 +786,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     }
   }
   const { verdict, reason: verdictReason } = decideVerdict({
-    kind, jevDone, loopReason, inputs: Object.keys(allInputs).length ? allInputs : undefined, submitted, findings, expectResults, error, missingDetail,
+    kind, jevDone, loopReason, inputs: Object.keys(allInputs).length ? allInputs : undefined, submitted, certified, findings, expectResults, error, missingDetail,
   });
   let reason = mask(verdictReason);
   const video = page?.video();
@@ -778,7 +814,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
     name: s.name, kind, run, verdict, reason, steps: calls,
     seconds: Math.round((performance.now() - started) / 100) / 10,
     jevCalls: calls, jevMsAvg: calls ? Math.round(jevMs / calls) : 0, inputTokens: tokens,
-    findings: findings.map((f) => ({ ...f, detail: mask(f.detail), url: mask(f.url) })),
+    findings: findings.map((f) => persistFinding(f, mask)),
     trail: trail.map((t) => (t.phase === undefined ? t : { ...t, phase: mask(t.phase) })),
     requests: timeline.requests.map((r) => ({ ...r, url: mask(r.url) })),
     responses: timeline.responses.map((r) => ({ ...r, url: mask(r.url) })),

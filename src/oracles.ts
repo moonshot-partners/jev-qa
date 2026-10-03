@@ -54,7 +54,10 @@ export function record(sink: Sink, url: string, step: number, kind: string, deta
   const result = classify(kind, detail, opts);
   if (!result) return;
   if (sink.findings.some((f) => f.kind === result.kind && f.detail === detail)) return;
-  sink.findings.push({ kind: result.kind, detail: detail.slice(0, 400), url, step });
+  // Round 9 (P1): kept whole (bounded only against runaway messages). The runner masks secret
+  // inputs and THEN clips to 400 (persistFinding) — clipping first could cut a secret at the
+  // boundary into a prefix the mask no longer recognises.
+  sink.findings.push({ kind: result.kind, detail: detail.slice(0, 20_000), url, step });
 }
 
 // Watches a page for the run's duration and returns a `detach()` that

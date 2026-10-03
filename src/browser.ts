@@ -47,9 +47,15 @@ async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
       .evaluate((e) => {
         const cs = getComputedStyle(e as Element);
         const px = (v: string) => parseFloat(v) || 0;
-        return { l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom) };
+        const h = e as HTMLElement;
+        return { l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom), ow: h.offsetWidth, oh: h.offsetHeight };
       })
-      .catch(() => ({ l: 0, t: 0, r: 0, b: 0 }));
+      .catch(() => null);
+    // Round 9 (P2): frame-local coordinates are added to the frame's on-page box unscaled, so a
+    // CSS-transformed frame (its own, or an ancestor's: scale, rotate) would put the click on a
+    // different control while every hit test still passes. Its on-page size then differs from
+    // its untransformed layout size — refuse such a frame instead of guessing.
+    if (!inset || Math.abs(box.width - inset.ow) > 1 || Math.abs(box.height - inset.oh) > 1) return null;
     return { x: box.x + inset.l, y: box.y + inset.t, w: Math.max(0, box.width - inset.l - inset.r), h: Math.max(0, box.height - inset.t - inset.b) };
   } finally {
     await el.dispose().catch(() => {});
@@ -118,7 +124,7 @@ export async function observe(page: Page): Promise<Observation> {
 // For a frame-hosted target the check is two-sided: inside the frame (frame-local
 // coordinates) the point must hit the target; in the main document (page coordinates) it must
 // hit an <iframe> — a modal, a sticky bar or a popover laid over the frame would otherwise
-// swallow the click. Intermediate frames of a deeper nesting are not checked separately.
+// swallow the click. Every intermediate frame of a deeper nesting is checked the same way.
 async function point(page: Page, node: number, frameIndex?: number): Promise<{ x: number; y: number }> {
   const frame = frameOf(page, frameIndex);
   const p = await frame.evaluate((id) => {
@@ -139,20 +145,24 @@ async function point(page: Page, node: number, frameIndex?: number): Promise<{ x
   const x = p.x + box.x;
   const y = p.y + box.y;
   if (p.x < 0 || p.y < 0 || p.x > box.w || p.y > box.h) throw new Error('target outside its frame');
-  // The element under the page point in the PARENT document must be this frame's own <iframe>:
-  // a sibling frame laid over it, or any other element, would receive the click instead. The
-  // point is translated into the parent's viewport for nested frames.
-  const parent = frame.parentFrame();
-  const parentBox = parent ? await frameBox(parent) : null;
-  const el = await frame.frameElement().catch(() => null);
-  if (!parent || !parentBox || !el) throw new Error('target frame not visible');
-  let own: boolean;
-  try {
-    own = await el.evaluate((e, [px, py]) => document.elementFromPoint(px, py) === e, [x - parentBox.x, y - parentBox.y] as [number, number]);
-  } finally {
-    await el.dispose().catch(() => {});
+  // At EVERY level up to the main document (round 9, P2: not just the direct parent), the
+  // element under the page point must be that level's own <iframe>: an overlay in any ancestor
+  // document, or a sibling frame laid over it, would receive the click instead. The point is
+  // translated into each parent's own viewport.
+  for (let cur: Frame = frame; cur.parentFrame(); ) {
+    const parent = cur.parentFrame()!;
+    const parentBox = await frameBox(parent);
+    const el = await cur.frameElement().catch(() => null);
+    if (!parentBox || !el) throw new Error('target frame not visible');
+    let own: boolean;
+    try {
+      own = await el.evaluate((e, [px, py]) => document.elementFromPoint(px, py) === e, [x - parentBox.x, y - parentBox.y] as [number, number]);
+    } finally {
+      await el.dispose().catch(() => {});
+    }
+    if (!own) throw new Error('target occluded (frame covered)');
+    cur = parent;
   }
-  if (!own) throw new Error('target occluded (frame covered)');
   return { x, y };
 }
 

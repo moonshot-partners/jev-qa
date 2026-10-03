@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildBody, decide, newPseudonyms, redactionForms } from '../src/jev.ts';
+import { buildBody, decide, newPseudonyms, redactionForms, redactValue } from '../src/jev.ts';
 import type { Decision, HistoryEntry, Observation } from '../src/jev.ts';
 
 function escapeHtml(s: string): string {
@@ -542,4 +542,13 @@ test('decide: a normal 200 response never touches the degradation ladder (degrad
   const d: Decision = await decide(baseObs(), 'goal', {}, [], new Set(), [], undefined, { fetch: fetchFn });
   assert.equal(bodies.length, 1);
   assert.equal(d.degraded, null);
+});
+
+
+// Round 9 (P1): a browser's application/x-www-form-urlencoded serializer (WHATWG) leaves `*`
+// literal and sends space as `+`; the redaction must know that exact form.
+test('redactionForms covers the WHATWG form encoding (literal *, %7E, + for space)', () => {
+  assert.ok(redactionForms('foo* bar').includes('foo*+bar'));
+  assert.ok(redactionForms('a~b c').includes('a%7Eb+c'));
+  assert.equal(redactValue('https://x.test/login?pw=foo*+bar&n=1', 'foo* bar', '«pw»'), 'https://x.test/login?pw=«pw»&n=1');
 });

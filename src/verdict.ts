@@ -12,6 +12,9 @@ export type VerdictInput = {
   loopReason: string;
   inputs?: Record<string, string>;
   submitted: Set<string>;
+  // Round 9 (P1): input NAMES certified per phase (runner.ts certifiedInputKeys). When present it
+  // decides; `submitted` (values) remains the fallback for callers that only know values.
+  certified?: Set<string>;
   findings: Finding[];
   expectResults?: ExpectResult[];
   error?: string;
@@ -70,7 +73,7 @@ export function decideVerdict(input: VerdictInput): { verdict: Verdict; reason: 
   if (input.kind === 'adversarial') {
     const inputs = input.inputs ?? {};
     const missing = Object.entries(inputs)
-      .filter(([, v]) => !input.submitted.has(v))
+      .filter(([k, v]) => !(input.certified ? input.certified.has(k) : input.submitted.has(v)))
       .map(([k]) => k);
     if (missing.length) {
       // N4/N5b (round 8): a missing key with extra detail (a partial-prefix match, or an
