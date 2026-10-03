@@ -159,3 +159,22 @@ test('config.smoke() output is validated too: a bad role is rejected, not silent
     /unknown role "ghost"/,
   );
 });
+
+
+// Round 10 (P1): certification is value-based, so two keys of one phase that share a value can't
+// be told apart — an adversarial scenario that does so is refused instead of over-certified.
+test('adversarial: two inputs of the same phase with the same value are refused', () => {
+  const dir = tmpDir('jevqa-dupvals-');
+  writeFileSync(join(dir, 'scenarios.json'), JSON.stringify([
+    { name: 'adversarial/dup', role: null, start: '/', goal: 'g', inputs: { password: 'same-v', confirmation: 'same-v' } },
+  ]));
+  assert.throws(() => loadScenarios(baseConfig({ scenarios: 'scenarios.json' }), dir), /share the value|same value/);
+});
+
+test('acceptance: two inputs with the same value stay allowed', () => {
+  const dir = tmpDir('jevqa-dupvals-ok-');
+  writeFileSync(join(dir, 'scenarios.json'), JSON.stringify([
+    { name: 'acc/dup', role: null, start: '/', goal: 'g', inputs: { password: 'same-v', confirmation: 'same-v' }, expect: [{ url: '/' }] },
+  ]));
+  assert.equal(loadScenarios(baseConfig({ scenarios: 'scenarios.json' }), dir).length, 1);
+});

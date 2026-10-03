@@ -41,15 +41,15 @@ the `scenarios` glob(s); see `src/scenario.ts` for the schema.
 | File | Purpose |
 |---|---|
 | `src/config.ts` | `Config`/`Environment`/`Role` types, `loadConfig`, `resolveBaseUrl`, minimal glob |
-| `src/scenario.ts` | `Scenario` type, JSON loading + validation, kind inference |
+| `src/scenario.ts` | `Scenario`/`Phase` types, JSON loading + validation, kind inference; `{{run}}` substitution (`applyRunId`), `scenarioPhases` |
 | `src/jev.ts` | `buildBody()` (pure, redacts every input value) + `decide()` (fetch, retry, edge-block ladder, validate) |
-| `src/browser.ts` | Playwright observe/act (snapshot-driven, coordinate input) |
-| `src/snapshot.js` | In-page DOM snapshot (MIT, `snapshot.LICENSE`) |
+| `src/browser.ts` | Playwright observe/act (snapshot-driven, coordinate input); merges every child frame's snapshot into the observation (`frame` index + page coordinates, two-sided hit test) |
+| `src/snapshot.js` | In-page DOM snapshot (MIT, `snapshot.LICENSE`); runs once per frame; password fields listed by name only, their value never read |
 | `src/oracles.ts` | `classify`/`record`/`watch`/`drainPending`: pageerror, console.error, 4xx/5xx, own-origin requests (`sink.requests`) and responses, `known:` tagging |
 | `src/expect.ts` | Pure `evaluate()` of `expect` assertions against a captured page state |
 | `src/submission.ts` | Pure `submittedInputs()`: STRONG-ONLY (round 8) — an own-origin request that demonstrably carries the value, in the fill's own window; `uninspectableRequest()` flags a plausible-but-unconfirmable candidate for a more specific BLOCKED reason |
 | `src/verdict.ts` | Pure `decideVerdict()` + `refusedByEnvironment()` |
-| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop, parallel queue, results.json |
+| `src/runner.ts` | `runAll`/`runOne`: the guarded step loop (once per phase), parallel queue, results.json (incl. `finalText`, what the settled final page said); `maskSecrets` |
 | `src/report.ts` | HTML grid report + `summarize()` |
 | `src/replay.ts` | `replayUrls`/`replayRun`: re-request findings without Jev in the loop |
 | `src/env.ts` | Minimal `.env` loader |
@@ -238,10 +238,58 @@ Every redacted surface uses the *identical* `«key»` token (current_value,
 runner has already certified as submitted is pruned out of the request
 entirely, not just relabelled — see guard 27.
 
+`decide()` hands the runner the observation's ORIGINAL action entries (raw `value`), not the
+redacted copies the request carried: the guards that compare a field's value with what the run
+typed depend on it. `buildBody()`'s own return stays fully redacted.
+
+**Password fields** are offered to Jev by name only (`secret: true`), never with a value —
+see "Password fields" under Frames. The value typed into one is a scenario input and is
+redacted from every request surface exactly like a hostile string. Since inputs are
+otherwise deliberately readable in `results.json`/`report.html`, a scenario lists such
+keys under `secretInputs`: the trail, the certified-inputs list and the reason then show
+`«key»` in place of the value. Jev still learns the value's LENGTH from the input
+descriptor (`N characters`), as for any input.
+
+### Frames
+
+Third-party payment fields, embedded editors and widgets live in `<iframe>`s, often
+cross-origin, where a top-document snapshot sees nothing. `observe()` runs the snapshot
+script in the main document AND in every child frame (`frame.evaluate`, which works across
+the origin boundary), so the engine never needs DOM access from the parent. A frame-hosted
+control is offered like any other, with:
+
+- `frame`: an index into the frame table `observe()` keeps per page (0/absent = the main
+  document). Indices are assigned in first-seen order and never reused for the page's
+  lifetime, so a frame inserted by a re-render is appended and never shifts an index an
+  earlier decision still holds. Node ids are per frame, so Jev's element list keys on
+  `frame:node`.
+- geometry translated to page coordinates by the `<iframe>` element's content box (its
+  border box from Playwright's main-frame-relative `boundingBox()`, nested frames included,
+  plus the element's own border and padding); a control whose centre falls outside its
+  iframe's box or the viewport is dropped, as the browser could not deliver a click there.
+- the frame's visible text appended to the page text.
+
+Input is unchanged — click at page `x,y`, then type — so a cross-origin card field is
+filled exactly like a main-document one. The hit test before input is two-sided: inside
+the frame the point must land on the target; in the parent document it must land on this
+frame's OWN `<iframe>` element (a modal, sticky bar, popover — or a sibling frame — laid over
+it refuses the input with `target occluded (frame covered)`). `focusAndVerify()` checks `document.activeElement`
+in the target's own frame.
+
+### Password fields
+
+`type=password` inputs are listed as fillable textboxes **by name only**, flagged
+`secret: true` for Jev. Their value is never read: the observation, the page key and the
+guard record only whether the field holds anything (`•`), never what. The text typed into
+one comes from a scenario input like any other fill, so `buildBody()`'s redaction keeps
+that value out of every request surface; list its key under the scenario's
+`secretInputs` to keep it out of `results.json` and the report too (see Secrets).
+
 ## Guards
 
 Every harness lesson from the spike's `MORNING.md` survives extraction:
 
+0. On a multi-field form (never in an adversarial run, which feeds every input into one control by design, and never over a target an `inputFields` hint chose), a field that already holds another scenario input THIS RUN TYPED THERE (a prefilled value that merely equals an input does not count) is never overwritten with a different one: the fill goes to the empty (or foreign) target Jev ranked next-best, or is skipped so Jev re-decides on a fresh observation. A fill that never executed (detached, occluded) is recorded as failed and never counts as "already typed" — Jev's target and text questions are answered independently, so it can pair the postcode with the country field it was looking at; and the `text_value` criteria say which inputs were already typed and where, from the FULL history rather than the ten-entry `recent_actions` window — `src/runner.ts` (guard), `src/jev.ts` (`typedInto`).
 1. Hostile strings live in scenario `inputs`, never in a prompt — `src/jev.ts` (Jev only ranks offered targets/inputs, never generates text; `buildBody()` additionally redacts every occurrence of an input value out of everything else in the request — see guard 21).
 2. Hover-opened menus toggle closed on the first click after hover — `src/browser.ts:58`.
 3. Repeat guard: retake Jev's next-best target (or scroll) when it re-picks its last action — `src/runner.ts:140`.
@@ -251,7 +299,7 @@ Every harness lesson from the spike's `MORNING.md` survives extraction:
 7. Known-issue tagging: triaged findings stay in the report as `known:<id>` but never fail a run, whichever oracle raised them (console/response/crash-screen alike) — `src/oracles.ts:36` (`classify`), `src/oracles.ts:47` (`record`, shared by `watch`'s oracles and the runner's own crash checks).
 8. Own-origin 401/403 don't poison the console-error oracle: same-step `known:authz` tagging — `src/oracles.ts:73`.
 9. A crash-screen check runs every step, independent of Jev's reading of the page — `src/runner.ts:117` — **and once more after the loop ends, on the settled final page** (guard 22): the per-step check alone never looks at the page AFTER the LAST action.
-10. Stuck detection (4 identical actions, or 4 actions with no page change) ends a run without failing it — `src/runner.ts:219`.
+10. Stuck detection (4 identical EXECUTED actions, or 4 actions with no page change, or 4 consecutive attempts that could not execute at all — a permanently occluded or detached target) ends a run without failing it — `src/runner.ts:219`. A BLOCKED answer first SCROLLS DOWN while the page continues below the fold (up to five screens, each its own step, and only while a scroll actually moves the page — the snapshot offers only the viewport, so the control Jev needs may not be on screen yet: a form's checkboxes and submit button under a long list of fields), then gets two settle chances (a client-rendered page often looks empty for a moment) before it ends the run.
 11. A cookie/consent interstitial is app-specific, so it is a config hook (`beforeEach`), not a hard-coded selector — `src/config.ts:43`, `src/runner.ts:103`.
 12. Generated smoke scenarios (role × page) are config-supplied (`smoke()`), not a separate script, and validated exactly like any other scenario — `src/config.ts:44`, `src/scenario.ts:104`.
 13. End-of-run rescue `Enter`: narrow on purpose — only for `adversarial` scenarios, only when the trailing fill's text is literally one of `s.inputs`' values (never an incidental form field), and only within the last two executed steps — `src/runner.ts:228`. Decides whether to fire by ACTUAL certification (`needsRescue()`, `src/submission.ts`), not by "was there any event at or after this step" — that heuristic suppressed the rescue on evidence that doesn't certify (an inert click, an unrelated poll request), leaving a real hostile input unsubmitted. Never records a submit event if the press itself rejects (true for this rule and guard 4 alike).
@@ -313,19 +361,145 @@ The loader dynamic-imports the file and validates it at run time.
 | `guardRequest` | `(url, env) => string \| { refuse }` | Applied to every request the engine sends outside the browser (`replay`), which `setupContext` routes cannot see. Return the URL to send (possibly rewritten) or `{ refuse: reason }`; a refused URL is reported as `REFUSED` and never sent. Keep it consistent with the `setupContext` rails. |
 | `beforeEach` | `(page) => Promise<void>` | Runs after the start navigation, before step 1 (cookie banners). |
 | `smoke` | `() => Scenario[]` | Generated scenarios; kind forced to `smoke`; validated like JSON ones. |
-| `checks` | `{ [name]: (ctx, args) => Promise<{ ok, detail }> }` | App-owned read-only assertions used by `expect: [{ check: { name, args } }]`. `ctx` has `env`, `role`, `page`, `request`. |
+| `checks` | `{ [name]: (ctx, args) => Promise<{ ok, detail, url? }> }` | App-owned read-only assertions used by `expect: [{ check: { name, args } }]`. `ctx` has `env`, `role`, `page`, `request`. A check may also return `url`: that lets it START a later phase (`then[].start: { check }`) — e.g. read a mailbox and hand back the link in the message. |
 | `redact` | `string[]` or `() => string[]` | Extra secrets that may appear on the page (a role's own email or password). Redacted to `«secret»` before any decision request. |
 | `scenarios` | `string` or `string[]` | Glob(s) relative to the config file's directory, e.g. `scenarios/**/*.json`. |
 
 Scenario fields: `name`, `kind` (`smoke` / `adversarial` / `acceptance`; inferred from the `smoke/` and
-`adversarial/` name prefixes when absent), `role`, `start`, `goal`, `inputs`, `maxSteps`, `expect`,
-`mutates`, `intent`. See `src/scenario.ts` for validation rules (an acceptance scenario needs at least one
-`expect`; an adversarial one needs at least one input).
+`adversarial/` name prefixes when absent), `role`, `start`, `goal`, `inputs`, `inputFields`, `maxSteps`,
+`expect`, `mutates`, `intent`, `then`, `secretInputs`. See `src/scenario.ts` for validation rules (an acceptance
+scenario needs at least one `expect`; an adversarial one needs at least one input).
+
+### Phases: `then`
+
+A scenario can continue past its main goal in one or more **phases**, on the same page and
+context (login and cookies carry over):
+
+```json
+{
+  "name": "acceptance/sign-up",
+  "role": null,
+  "start": "/sign-up",
+  "goal": "register a new account with the email",
+  "inputs": { "email": "qa-{{run}}@example.test" },
+  "expect": [{ "url": "/welcome" }],
+  "then": [
+    {
+      "name": "set password",
+      "start": { "check": { "name": "welcomeLink", "args": { "inbox": "qa-{{run}}@example.test" } } },
+      "goal": "choose the password and submit",
+      "inputs": { "password": "Pw-{{run}}!" },
+      "expect": [{ "url": "/dashboard" }, { "text": "Signed in" }]
+    }
+  ],
+  "secretInputs": ["password"]
+}
+```
+
+- A phase's `response` assertions see only the responses recorded during that phase, from its
+  own start navigation (or start check) on; an earlier phase's traffic never satisfies a later
+  phase's assertion. `beforeEach` runs again on each phase's start page; if it throws there
+  (a consent banner that is not on that page) the phase goes on and the trail notes it.
+- `start` is a path/URL, or `{ check: { name, args? } }`, or **absent** — the phase then continues
+  on the page exactly as the previous phase left it (a multi-step form whose next step is
+  already showing), with its own goal, inputs and expectations; keep each phase's goal to what
+  is on screen in that phase — a goal that describes controls no longer on the page makes Jev
+  answer BLOCKED. With a path or check, the config check runs on the current
+  page (it may read a mailbox, an API, a database) and returns `{ ok, detail, url }`; the phase
+  begins at that `url` (absolute, or relative to the role's base). `ok: false` **fails** the run
+  as a named expectation of that phase (`phase "set password" expect #0 check: …`); `ok` without
+  a `url` is a config bug and reports ERROR.
+- **Expectations settle.** The last action's effect may still be in flight when Jev answers
+  DONE (a submit whose button reads "Processing…"): before the one real evaluation, the pure
+  assertions (`url`, `text`, `absentText`, `element`, `response`) listed BEFORE the first
+  `check` get up to 20 s to come true. A `check` runs app code and may act (open a link), so it
+  is never polled, and an assertion after it may be describing what that check produces. The trail notes a wait over 1.5 s
+  and a settle that timed out. This applies to the scenario's own `expect` as well as a phase's.
+- Each phase has its own `goal`, `maxSteps` (default 25), `expect`, and `inputs` (merged over the
+  scenario's; the same key in a phase overrides). Jev's history restarts per phase; the oracle,
+  the trail and the step counter continue. The next phase runs only when the previous one
+  reached Jev DONE with every expectation met.
+- **Certification is per phase.** A value the main phase already got certified (the sign-up
+  email) is offered again, uncertified, to a phase that needs it once more (the same email on
+  the login page); the adversarial verdict still requires EVERY input of every phase to have
+  reached the server (a key reused with a new value counts twice, reported as `key#2`).
+- **Redaction spans phases.** While one phase runs, the input values of every other phase are
+  redacted from Jev requests as secrets (a page that echoes what an earlier phase typed).
+- A failed expectation — including a phase whose start check reported `ok: false` — is FAIL
+  for **every** kind, smoke and adversarial included. An acceptance scenario needs at least one
+  expectation on the scenario OR on a phase; any kind that has them is held to them.
+- **Adversarial rule across phases:** every distinct (key, value) declared anywhere in the
+  scenario must have reached the server at least once in the run — certified inside the window
+  of the phase that typed it (a later phase's start navigation carrying the value never
+  certifies an earlier phase's unsubmitted fill). A value inherited by a later phase and not
+  typed again there is not a failure — the phase inherits the certification, not the
+  obligation. An adversarial scenario may declare its hostile inputs on a phase only.
+- Results: `expectResults[].phase` and `trail[].phase` name the phase (absent for the main one);
+  the verdict is the scenario's as a whole.
+
+### `inputFields` — bind an input to its field
+
+Jev answers "which control" and "which input" as two independent questions, so on a long
+form the pairing drifts: the postcode lands in the country field, a card number in the ZIP.
+`inputFields` (on the scenario or on a phase, merged like `inputs`) binds an input key to the
+field it belongs in, by label — a case-insensitive substring or a `/regex/`:
+
+```json
+"inputs": { "postcode": "E1 6AN", "country": "United Kingdom" },
+"inputFields": { "postcode": "ZIP Code", "country": "/^Country/i" }
+```
+
+Jev still decides *when* to type and *which* input; the engine then types it into the offered
+fill target whose label matches (frame-hosted controls included), whatever target Jev named,
+and notes `→ inputFields: <label>` in the trail. A hint that matches nothing on the current
+page falls back to Jev's own target. Every key must be one of that scope's inputs — for a
+phase, its own or one inherited from the scenario (the sign-up email hinted again on the login
+page needs no redeclaration).
+
+### `{{run}}` — a value unique to each run
+
+Anywhere in a scenario's strings (`start`, `goal`, `inputs`, `expect`, every phase and its check
+`args`) — but never in the scenario's `name` nor a phase's `name` — the literal `{{run}}` is replaced, once per run, by a short
+url/email-safe id (base-36 time + random, e.g. `mf3k2p9q7x1z`). `results.json` records it as
+`runId`, so what a run created can be found by the value it typed. `--repeat 3` produces three
+different ids.
+
+### `secretInputs`
+
+Keys of `inputs` (or a phase's inputs) whose value must not reach `results.json` or the
+report: the trail (typed text, labels, urls — including labels appended later by the repeat
+and certified guards), the persisted request/response urls, the findings, the expectation
+results (their `assertion` too), the `intent` (a REFUSED run's included), the certified-inputs
+list and the reason show `«key»` instead — longest value first, so a value that prefixes a
+longer one cannot expose its tail, and always before any clipping, so a cut never leaves a
+prefix of a secret behind — in every form `buildBody()`'s own redaction covers (raw, percent- and form-encoded as
+a GET form carries it, HTML- and JSON-escaped), and for every value the key ever had across
+phases. Every input value is already kept out of Jev requests (see Secrets); this covers the
+run's own outputs, for a password set during the run. Such a scenario **records nothing**
+— no video of any page of its context (the login page included) and no final screenshot:
+an image shows whatever the page showed, a typed password included, and cannot be masked.
+
+**Not covered:** a value the run never typed — e.g. a one-time token inside the url a start
+check returned — is scrubbed from Jev requests by the generic `«token:N»` rule but persists
+raw in `results.json`'s request urls, as any tokenised url always has. Keep run output private,
+or have the check return a url whose token is already consumed by the time the report is read.
 
 ## Known limitations
 
 - Jev has no vision and no text generation. It picks one operation and one target from what the snapshot
   offers. Hostile strings live in scenario `inputs`; the engine substitutes them locally.
+- Frames: the parent-side hit test checks the MAIN document only (the point must land on an `<iframe>`);
+  an intermediate frame of a deeper nesting is not checked separately. A frame that refuses evaluation
+  (about:blank, mid-navigation) is skipped for that step. Frame text is appended after the main text and
+  clipped with it. The repeat guard compares action labels, so two frames offering a control with the
+  SAME label (two "Continue" buttons) can trip it; the replace guard keys on the exact control (node +
+  frame) and is not affected.
+- Frames: an `<iframe>` under a CSS `transform` (scale/rotate) is not handled — frame-local coordinates
+  are added unscaled to the element's box, so a scaled frame's controls are missed.
+- A click is one `mouse.click` at page coordinates (down and up in one go). A page whose layout shifts ON
+  MOUSEDOWN (a field blurs, a block expands, the button moves out from under the pointer — seen with a
+  hosted payment element's "save my info" block) can swallow a slower, human-paced press that this fast
+  click still wins; the engine does not re-hit-test between down and up.
 - Runs are non-deterministic. Repeat a scenario (`--repeat 3`) before treating a verdict as stable.
 - Certification compares the typed value with the decoded request value as sent. A value the app
   normalises before sending (case change, trimmed whitespace, collapsed spaces) is not certified; the
@@ -412,6 +586,41 @@ REPLACE guard's own debounce-grace poll (guard 46), not luck or an
 unrelated wait, is what lets a value certify without the runner ever
 forcing an Enter into the field; both values end up submitted and the
 trail carries no `auto-submitted previous value` entry.
+`test/phases.test.ts` covers `newRunId()`, `applyRunId()` (every string but `name`,
+check args included, original untouched, non-plain objects such as a Date passed
+through), `scenarioPhases()`, `scenarioInputs()`, `maskSecrets()` (encoded forms, a
+reused key's every value), the verdict on a failed phase for every kind, and
+scenario validation of `then`/`secretInputs`.
+`test/phases.browser.test.ts` runs the real runner (fake `decide`) through a
+two-phase scenario: the main phase submits a `{{run}}` email, a config check
+receives the substituted args and returns the second phase's start url, the
+second phase types the SAME email again (offered uncertified: certification is per
+phase) plus a `{{run}}` password (`secretInputs`) and its own expectations are
+evaluated and tagged — the certified list carries `«password»`, the value appears
+nowhere in the result in any encoding (the GET form carried it as `%21`), and the
+later phase's password was already redacted as a secret while the main phase ran; a
+second scenario proves a check reporting `ok: false` FAILs the run naming the phase
+(for a smoke scenario too), and one returning no url reports ERROR; the `intent` and
+an `absentText` assertion quoting the secret come out masked; and a tall page whose
+submit button sits below the fold is completed by the BLOCKED auto-scroll (the fake
+`decide` answers BLOCKED whenever the button is not in the snapshot).
+Round-3 additions: `maskSecrets` longest-first, `flattenInputs` name collisions,
+phase names exempt from `{{run}}`, `~` in form encoding; in the browser files: a
+sibling iframe laid over the target frame is refused, a REFUSED run masks its
+intent, a phase's `response` assertion cannot ride on an earlier phase's response,
+an ineffective BLOCKED scroll stops after one attempt, a field holding another
+input is not overwritten when Jev offered an empty alternative.
+`test/frames.browser.test.ts` drives `observe()`/`act()` directly against a
+page embedding an `<iframe>`: the framed input and button are offered with
+page coordinates and `frame: 1`, typing/clicking by those coordinates lands
+inside the frame, a main-document overlay over the iframe makes `act()`
+refuse (`occluded`) while the frame-side snapshot alone could never see it
+(mutation-checked), the same node id in two frames stays two Jev elements,
+a frame inserted before the payment frame by a re-render does not shift the
+index an earlier action holds, the iframe's border and padding are accounted
+for in the translated geometry, and a password field is offered by name with
+its value never read before or after typing — while `buildBody()` never sends
+the input value.
 `test/replay.browser.test.ts` proves `replayUrls()` releases its browser
 even when `role.login()` throws. Set `JEV_QA_NO_BROWSER=1` to skip both
 browser files. `test/runner.test.ts` unit-tests `capRecent()` and

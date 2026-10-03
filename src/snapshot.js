@@ -6,7 +6,11 @@
     const id=cache.ids.get(e); cache.nodes.set(id,e); return id;
   };
   for (const [id,e] of cache.nodes) if (!e.isConnected) cache.nodes.delete(id);
-  const safe = e => !['password','file','hidden'].includes(e.type);
+  const safe = e => !['file','hidden'].includes(e.type);
+  // A password field is offered by NAME only: its value is never read into the snapshot, the
+  // page key or the guard (only whether it holds anything at all), so nothing here can carry it.
+  const secret = e => e.type==='password';
+  const shown = e => secret(e) ? (e.value ? '•' : '') : e.value;
   const visible = e => !e.closest('[aria-hidden="true"],[inert]') &&
     e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
   const name = (e,seen=new Set()) => {
@@ -37,17 +41,17 @@
       if (['button','submit','reset','image'].includes(e.type)) return 'button';
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
-      if (['text','email','url','tel'].includes(e.type)) return 'textbox';
+      if (['text','email','url','tel','password'].includes(e.type)) return 'textbox';
     }
     return null;
   };
   cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     [...document.querySelectorAll('input,textarea,select')].filter(safe)
-      .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+      .map(e=>[identity(e),shown(e),e.checked,e.selectedIndex,e.disabled,e.readOnly])];
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
-    return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
+    return [identity(e),role(e),name(e),('value' in e ? shown(e) : null)??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
@@ -73,23 +77,30 @@
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
-      const value='value' in e ? String(e.value) :
+      const value=secret(e) ? '' : 'value' in e ? String(e.value) :
         e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '';
+      if (secret(e)) base.secret=true;
       actions.push({...base,kind:editable?'fill':'click',value});
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
   const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
   const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
+  // Round 11: the crash check gets its own sample of ALL visible text (bounded), never sent to
+  // the decision API — the whole-node rule below may leave a huge single node out of `text`.
+  const crash=[]; let crashLength=0;
+  while ((node=walker.nextNode()) && (length<6000 || crashLength<100000)) {
     const value=node.textContent.trim(), parent=node.parentElement;
     if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
     range.selectNodeContents(node); const r=range.getBoundingClientRect();
     if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
-      words.push(value); length+=value.length;
+      if (crashLength<100000) { crash.push(value); crashLength+=value.length+1; }
+      // Whole nodes only: a node cut at the cap could leave a secret prefix too short to redact.
+      if (length+value.length+(words.length?1:0)>6000) continue;
+      words.push(value); length+=value.length+(words.length>1?1:0);
     }
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const text=words.join('\n'), height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
@@ -102,6 +113,6 @@
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
-  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
+  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,crash_text:crash.join('\n'),
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

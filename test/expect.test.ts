@@ -146,3 +146,28 @@ test('getPath: missing path returns undefined instead of throwing', () => {
   assert.equal(getPath({ a: 1 }, 'a.b.c'), undefined);
   assert.equal(getPath(null, 'a.b'), undefined);
 });
+
+
+// Round 9 (P2): a pure assertion AFTER a check is polled (the check may start an asynchronous page
+// update) — but the check itself runs exactly once.
+test('evaluate: a pure assertion after a check settles; the check runs once', async () => {
+  let checks = 0;
+  let readyAt = Infinity;
+  const state = baseState({
+    bodyText: async () => (Date.now() >= readyAt ? 'Done' : 'Working'),
+    runCheck: async () => { checks++; readyAt = Date.now() + 200; return { ok: true, detail: 'ok' }; },
+  });
+  const results = await evaluate([{ check: { name: 'go' } }, { text: 'Done' }], state, { settleMs: 2000, intervalMs: 50 });
+  assert.equal(checks, 1);
+  assert.ok(results.every((r) => r.ok), JSON.stringify(results));
+});
+
+test('evaluate: without a settle window the old single read is kept (fails while still Working)', async () => {
+  let readyAt = Infinity;
+  const state = baseState({
+    bodyText: async () => (Date.now() >= readyAt ? 'Done' : 'Working'),
+    runCheck: async () => { readyAt = Date.now() + 200; return { ok: true, detail: 'ok' }; },
+  });
+  const results = await evaluate([{ check: { name: 'go' } }, { text: 'Done' }], state);
+  assert.equal(results[1].ok, false);
+});

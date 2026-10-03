@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildBody, decide, newPseudonyms, redactionForms } from '../src/jev.ts';
+import { buildBody, decide, newPseudonyms, redactionForms, redactValue } from '../src/jev.ts';
 import type { Decision, HistoryEntry, Observation } from '../src/jev.ts';
 
 function escapeHtml(s: string): string {
@@ -38,6 +38,25 @@ test('buildBody: redacts raw, URL-encoded, and HTML-escaped occurrences everywhe
   assert.ok(json.includes('script'), 'the key "script" should still be present');
 });
 
+test('buildBody: text_value criteria say which inputs were already typed and where, from the FULL history (beyond the 10-entry window)', () => {
+  const inputs = { first: 'Jev', email: 'a@b.test', zip: 'E1 6AN' };
+  const history: HistoryEntry[] = [
+    { action: 'First name', kind: 'fill', text: 'Jev', page_changed: false },
+    ...Array.from({ length: 12 }, (_, i) => ({ action: `Click ${i}`, kind: 'click', page_changed: false })),
+    { action: 'Email', kind: 'fill', text: 'a@b.test', page_changed: false },
+  ];
+  const obs: Observation = { ...baseObs(), actions: [{ id: 'e1', kind: 'fill', node: 1, role: 'textbox', label: 'ZIP', value: '' }] };
+  const { body } = buildBody(obs, 'fill the form', inputs, history);
+  const criteria = (body as { questions: { text_value: { criteria: Record<string, string> } } }).questions.text_value.criteria;
+  assert.match(criteria.first, /already typed into "First name"/, 'a fill older than the recent_actions window still counts');
+  assert.match(criteria.email, /already typed into "«email:1»"|already typed into "Email"/);
+  assert.doesNotMatch(criteria.zip, /already typed/);
+  assert.equal(JSON.stringify(body).includes('a@b.test'), false, 'the label is scrubbed like every other surface');
+  const failed: HistoryEntry[] = [{ action: 'ZIP', kind: 'fill', text: 'E1 6AN', page_changed: false, failed: true }];
+  const zipCriteria = (buildBody(obs, 'fill the form', inputs, failed).body as { questions: { text_value: { criteria: Record<string, string> } } }).questions.text_value.criteria;
+  assert.doesNotMatch(zipCriteria.zip, /already typed/, 'a fill that never executed does not count as typed');
+});
+
 // --- round 7 (M1): goal and history action labels were never redacted at all -----------------
 
 test('buildBody: redacts the goal wherever it appears (every instructions.goal)', () => {
@@ -73,6 +92,12 @@ test('redactionForms: the SQL injection string produces the exact real-world WAF
   // encodeURIComponent, then %20 replaced with + — a real GET form's own encoding.
   assert.ok(forms.includes('%27+OR+1%3D1%3B+--+%22'), `expected the form-encoded variant, got ${JSON.stringify(forms)}`);
   assert.ok(forms.includes(value), 'expected the raw value itself');
+});
+
+test('redactionForms: "~" is form-encoded as %7E (a browser form does; encodeURIComponent does not)', () => {
+  const forms = redactionForms('Pw~abc');
+  assert.ok(forms.includes('Pw%7Eabc'), `expected the %7E form in ${JSON.stringify(forms)}`);
+  assert.ok(forms.includes('Pw%7eabc'), 'lower-case hex too');
 });
 
 test('redactionForms: "<script>" produces named AND numeric (decimal + hex) HTML entity forms', () => {
@@ -392,6 +417,29 @@ test('decide: a certified key never appears in the outgoing text_value.criteria 
   assert.ok('b' in sentCriteria);
 });
 
+test('decide: the action and alternatives handed back are the ORIGINAL observation entries (raw value), not the redacted request copies', async () => {
+  const inputs = { a: 'alpha', b: 'beta' };
+  const obs = baseObs({ actions: [
+    { id: 'e1', kind: 'fill', node: 1, role: 'textbox', label: 'q', value: 'alpha' },
+    { id: 'e2', kind: 'fill', node: 2, role: 'textbox', label: 'r', value: '' },
+  ] });
+  const answers = {
+    answers: {
+      operation: { choice: 'TYPE_TEXT', confidence: 1, probabilities: { TYPE_TEXT: 1, DONE: 0, BLOCKED: 0 } },
+      type_text_target: { choice: '1', confidence: 0.6, probabilities: { '1': 0.6, '2': 0.4 } },
+      text_value: { choice: 'b', confidence: 1, probabilities: { a: 0, b: 1 } },
+    },
+    usage: { input_tokens: 10 },
+  };
+  const res = new Response(JSON.stringify(answers), { status: 200, headers: { 'content-type': 'application/json' } });
+  const { fetch: fetchFn, bodies } = fakeFetchSequence([res]);
+  const d: Decision = await decide(obs, 'goal', inputs, [], new Set(), [], undefined, { fetch: fetchFn });
+  assert.equal(d.action, obs.actions[0], 'same object as the observation');
+  assert.equal(d.action!.value, 'alpha', 'raw value, so the runner can compare it with what it typed');
+  assert.equal(d.alternatives[0], obs.actions[1]);
+  assert.ok(bodies[0].includes('«a»') && !bodies[0].includes('alpha'), 'the request itself still carried the redacted copy');
+});
+
 test('buildBody: an empty-string input value is never redacted against (would corrupt everything)', () => {
   const inputs = { empty: '', real: 'hostile' };
   const obs = baseObs({ text: 'some ordinary page text with hostile in it' });
@@ -494,4 +542,23 @@ test('decide: a normal 200 response never touches the degradation ladder (degrad
   const d: Decision = await decide(baseObs(), 'goal', {}, [], new Set(), [], undefined, { fetch: fetchFn });
   assert.equal(bodies.length, 1);
   assert.equal(d.degraded, null);
+});
+
+
+// Round 9 (P1): a browser's application/x-www-form-urlencoded serializer (WHATWG) leaves `*`
+// literal and sends space as `+`; the redaction must know that exact form.
+test('redactionForms covers the WHATWG form encoding (literal *, %7E, + for space)', () => {
+  assert.ok(redactionForms('foo* bar').includes('foo*+bar'));
+  assert.ok(redactionForms('a~b c').includes('a%7Eb+c'));
+  assert.equal(redactValue('https://x.test/login?pw=foo*+bar&n=1', 'foo* bar', '«pw»'), 'https://x.test/login?pw=«pw»&n=1');
+});
+
+// Round 11: a long secret's truncated echo is redacted by a linear scan (the old regex grew to
+// ~n²/2 characters and ran Node out of memory).
+test('redactValue: a 5,000-character secret cut at 3,000 characters is redacted, fast', () => {
+  const value = 'Lg7!' + Array.from({ length: 4996 }, (_, i) => String.fromCharCode(97 + ((i * 11) % 26))).join('');
+  const started = Date.now();
+  const out = redactValue('before ' + value.slice(0, 3000) + '… after', value, '«tok»');
+  assert.equal(out, 'before «tok»… after');
+  assert.ok(Date.now() - started < 1000, 'linear, not quadratic');
 });

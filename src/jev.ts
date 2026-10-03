@@ -41,17 +41,31 @@ export type Action = {
   expanded?: string;
   delta?: number;
   rect?: { x: number; y: number; w: number; h: number };
+  // Index into the frame table observe() built for this page: 0/undefined = the main document,
+  // n = the n-th child frame it snapshotted (an <iframe>, cross-origin or not). Geometry is
+  // already translated to main-frame (page) coordinates; `node` is an id in THAT frame's cache.
+  frame?: number;
+  // A password field: offered as fillable by name only. Its value is never read into the
+  // observation (always ''), and the text typed into it comes from a scenario input like any
+  // other fill — buildBody() redacts that value out of every request surface (see README
+  // "Secrets"); a scenario's `secretInputs` additionally keeps it out of results/reports.
+  secret?: boolean;
 };
 
 export type Observation = {
   url: string;
   title: string;
   text: string;
+  // Round 11: all visible text (bounded) for the LOCAL crash check only; buildBody() never sends it.
+  crash_text?: string;
   actions: Action[];
   omitted_actions: number;
+  w?: number; // viewport size, as the snapshot saw it (used to clip frame-hosted targets)
+  h?: number;
+  scroll?: { y: number; height: number }; // page scroll position and document height
 };
 
-export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null };
+export type HistoryEntry = { action: string; kind: string; text?: string | null; page_changed?: boolean | null; failed?: boolean };
 
 // null = no degradation was needed. Otherwise: TypeSafe's edge WAF blocked
 // the normal request and the runner retried with less (see decide()'s ladder).
@@ -119,7 +133,24 @@ function numericEntity(value: string, format: (code: number) => string): string 
 // This exact gap was the real WAF trigger (round 7 addendum): encodeURIComponent(`' OR 1=1`)
 // leaves the quote as a literal `'`, but the real page's own URL carried it as `%27`.
 function formEncode(percentEncoded: string): string {
-  return percentEncoded.replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+  // `~` too: encodeURIComponent leaves it literal, a browser's form submission sends %7E.
+  return percentEncoded.replace(/[!'()*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+}
+
+// Round 9 (P1): what a browser's form submission ACTUALLY sends — the WHATWG
+// application/x-www-form-urlencoded byte serializer: `*-._` and alphanumerics stay literal, a
+// space becomes `+`, every other UTF-8 byte is %XX (uppercase). Note `*` stays LITERAL here,
+// unlike formEncode() above, which mirrors PHP-style urlencode (`%2A`) and is kept for servers
+// that echo a value that way.
+function whatwgFormEncode(value: string): string {
+  let out = '';
+  for (const byte of new TextEncoder().encode(value)) {
+    const c = String.fromCharCode(byte);
+    if (/[A-Za-z0-9*\-._]/.test(c)) out += c;
+    else if (byte === 0x20) out += '+';
+    else out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return out;
 }
 
 // Every string form a hostile input value could survive as by the time it's embedded somewhere
@@ -133,12 +164,14 @@ export function redactionForms(value: string): string[] {
   const percentLower = percentUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const formUpper = formEncode(percentUpper); // application/x-www-form-urlencoded — a real GET/POST form
   const formLower = formUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+  const whatwgUpper = whatwgFormEncode(value); // what a real browser <form> submission sends
+  const whatwgLower = whatwgUpper.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const htmlNamed = escapeHtml(value); // &amp; &lt; &gt; &quot; &#39;
   const htmlDecimal = numericEntity(value, (code) => `&#${code};`);
   const htmlHex = numericEntity(value, (code) => `&#x${code.toString(16)};`);
   const jsonPlain = JSON.stringify(value).slice(1, -1); // quotes/backslashes/controls only
   const jsonAscii = jsonAsciiEscape(value); // every non-ASCII char \uXXXX too (astral as a surrogate pair)
-  return [value, percentUpper, percentLower, formUpper, formLower, htmlNamed, htmlDecimal, htmlHex, jsonPlain, jsonAscii];
+  return [value, percentUpper, percentLower, formUpper, formLower, whatwgUpper, whatwgLower, htmlNamed, htmlDecimal, htmlHex, jsonPlain, jsonAscii];
 }
 
 function escapeRegExp(s: string): string {
@@ -156,21 +189,39 @@ function escapeRegExp(s: string): string {
 // truncation boundary — a non-alphanumeric character, an ellipsis (`…` or `...`), or the end of
 // the string — never mid-word, so a real 12-char prefix can't accidentally match as a SUBSTRING
 // of some longer, unrelated word either.
-function prefixPattern(value: string): RegExp | null {
-  if (value.length < 16) return null;
-  const prefixes: string[] = [];
-  for (let len = value.length - 1; len >= 12; len--) prefixes.push(escapeRegExp(value.slice(0, len)));
-  // A single non-alphanumeric character already covers an ellipsis (either "…" or the first "."
-  // of "...") as well as ordinary punctuation/whitespace; `$` covers a prefix that runs to the
-  // very end of the text with nothing after it at all.
-  return new RegExp(`(?:${prefixes.join('|')})(?=[^A-Za-z0-9]|$)`, 'g');
+// Round 11: a linear scan with the SAME semantics as the old one-regex-per-value alternation of
+// every prefix (longest first), which grew to ~n²/2 characters and ran Node out of memory for a
+// long secret (a 4,000-character value built an ~8M-character pattern). For each occurrence of
+// the value's first 12 characters: extend while the text agrees with the value (at most
+// length - 1 — the whole value is handled by redactionForms()), then step back to the longest
+// prefix that ends at a genuine truncation boundary (a non-alphanumeric character, or the end).
+function redactTruncatedPrefixes(text: string, value: string, marker: string): string {
+  if (value.length < 16) return text;
+  const head = value.slice(0, 12);
+  const isBoundary = (i: number) => i >= text.length || /[^A-Za-z0-9]/.test(text[i]);
+  let out = '';
+  let from = 0;
+  for (let i = text.indexOf(head, from); i !== -1; i = text.indexOf(head, from)) {
+    let k = 12;
+    while (k < value.length - 1 && i + k < text.length && text[i + k] === value[k]) k++;
+    let end = -1;
+    for (let len = k; len >= 12; len--) if (isBoundary(i + len)) { end = i + len; break; }
+    if (end === -1) {
+      out += text.slice(from, i + 1);
+      from = i + 1;
+      continue;
+    }
+    out += text.slice(from, i) + marker;
+    from = end;
+  }
+  return out + text.slice(from);
 }
 
 // Redacts every occurrence of ONE value (in every form redactionForms() produces, plus any
-// truncated prefix — see prefixPattern()) to ONE marker. Shared by redact() (per-input, marker
+// truncated prefix — see redactTruncatedPrefixes()) to ONE marker. Shared by redact() (per-input, marker
 // is the input's own «key») and the config-secrets pass (round 8, N2 — marker is always
 // «secret», since a config secret has no scenario-input key to redact it BY).
-function redactValue(text: string, value: string, marker: string): string {
+export function redactValue(text: string, value: string, marker: string): string {
   if (!value) return text;
   let out = text;
   for (const variant of new Set(redactionForms(value))) {
@@ -184,9 +235,7 @@ function redactValue(text: string, value: string, marker: string): string {
       out = out.split(variant).join(marker);
     }
   }
-  const prefixes = prefixPattern(value);
-  if (prefixes) out = out.replace(prefixes, marker);
-  return out;
+  return redactTruncatedPrefixes(out, value, marker);
 }
 
 // Order doesn't matter: distinct scenario input values don't overlap in practice, and even if
@@ -256,7 +305,7 @@ function stripUrlQuery(url: string): string {
 
 function actionSpace(actions: Action[]) {
   const elements: Record<string, unknown>[] = [];
-  const indices = new Map<number, string>();
+  const indices = new Map<string, string>();
   const targets: Record<string, Record<string, Action>> = {};
   const controls: Record<string, Action> = {};
   const ops: Record<string, string> = { click: 'CLICK', fill: 'TYPE_TEXT', select: 'SELECT' };
@@ -266,12 +315,16 @@ function actionSpace(actions: Action[]) {
       controls[a.id.toUpperCase()] = a;
       continue;
     }
-    let index = indices.get(a.node!);
+    // Node ids are per FRAME (each frame keeps its own snapshot cache, each starting at 1), so
+    // the same id can name two different elements once frames are merged in — key by both.
+    const nodeKey = `${a.frame ?? 0}:${a.node!}`;
+    let index = indices.get(nodeKey);
     if (!index) {
       index = String(elements.length + 1);
-      indices.set(a.node!, index);
+      indices.set(nodeKey, index);
       const el: Record<string, unknown> = { index, label: a.label.split(' → ')[0], role: a.role, operations: [] };
       for (const k of ['value', 'checked', 'selected', 'expanded'] as const) if (a[k] !== undefined) el[k] = a[k];
+      if (a.secret) el.secret = true; // a password field: fill it by name; its value is never shown
       if (a.kind === 'select') Object.assign(el, { value: a.current_value ?? '', options: [] });
       elements.push(el);
     }
@@ -299,6 +352,7 @@ export type BuiltRequest = {
   targets: Record<string, Record<string, Action>>;
   controls: Record<string, Action>;
   elements: Record<string, unknown>[];
+  originals: WeakMap<Action, Action>; // redacted copy → the observation's own entry
 };
 
 // PURE (no network): everything decide() sends to TypeSafe, and everything it
@@ -347,6 +401,15 @@ export function buildBody(
     expanded: a.expanded !== undefined ? redactField(a.expanded, valueClip) : undefined,
   }));
   const { elements, targets, controls } = actionSpace(redactedActions);
+  // Everything buildBody() returns stays REDACTED (the request, and the tables used to read the
+  // answer). The map back to the ORIGINAL observation entries is what decide() hands the runner:
+  // it compares an action's current `value` with the raw text it typed (the overwrite and
+  // already-holds guards), and a redacted «key» token can never equal a raw value — those guards
+  // were dead against a real Jev answer. A WeakMap serialises to {} and carries nothing itself.
+  const originals = new WeakMap<Action, Action>();
+  obs.actions.forEach((a, i) => originals.set(redactedActions[i], a));
+
+  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
 
   // L2: keys already certified as submitted (see the function doc comment) are pruned from
   // every input-choosing surface below — not just filtered out of display, but genuinely never
@@ -396,14 +459,24 @@ export function buildBody(
     // that already contains the requested value") compares these as literal strings, and a
     // bare "query" next to a redacted "«query»" never matches. Numbered relative to what's
     // actually offered (remainingInputs), so "#1" is always the next uncertified input.
+    // Which inputs were ALREADY typed this phase, and where — from the FULL history, not the
+    // ten-entry `recent_actions` window: on a long form Jev's own "use the first one the recent
+    // actions have not typed yet" rule forgot the first fields once ten actions had passed and
+    // retyped them into whatever field it was looking at.
+    const typedInto = new Map<string, string>();
+    for (const h of history) {
+      if (h.kind !== 'fill' || h.text == null || h.failed) continue; // a fill that never executed typed nothing
+      const k = valueToKey.get(h.text);
+      if (k !== undefined && !typedInto.has(k)) typedInto.set(k, h.action);
+    }
     const criteria: Record<string, string> = {};
     remainingInputs.forEach((k, i) => {
-      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)`;
+      const typed = typedInto.get(k);
+      criteria[k] = `«${k}»: scenario input #${i + 1} (${inputs[k].length} characters)${typed ? `; already typed into "${scrubGeneric(redact(typed, inputs, secrets), pseudonyms)}"` : ''}`;
     });
     questions.text_value = { type: 'choice', criteria, instructions: { goal: redactedGoal, rules: TEXT } };
   }
 
-  const valueToKey = new Map(Object.entries(inputs).map(([k, v]) => [v, k]));
   const recentActions = history.slice(-10).map((h) => ({
     ...h,
     // M1 (round 7): the free-text action label (e.g. "Search flower") was never redacted at
@@ -432,7 +505,7 @@ export function buildBody(
     questions,
   };
 
-  return { body, operations, targets, controls, elements };
+  return { body, operations, targets, controls, elements, originals };
 }
 
 function isEdgeBlockBody(text: string): boolean {
@@ -510,7 +583,8 @@ export async function decide(
   const latencyMs = Math.round(performance.now() - started);
   const inputTokens = result.usage?.input_tokens ?? 0;
 
-  const { operations, targets, controls } = built!;
+  const { operations, targets, controls, originals } = built!;
+  const original = (a: Action) => originals.get(a) ?? a;
   const opAnswer = validate(result.answers.operation, Object.keys(operations));
   const operation = opAnswer.choice;
   let action: Action | null = null;
@@ -519,9 +593,9 @@ export async function decide(
   if (operation in targets) {
     const head = targets[operation];
     const t = validate(result.answers[`${operation.toLowerCase()}_target`], Object.keys(head));
-    action = head[t.choice];
+    action = original(head[t.choice]);
     for (const [k, p] of Object.entries(t.probabilities).sort((a, b) => b[1] - a[1])) {
-      if (k !== t.choice && p >= 0.05) alternatives.push(head[k]);
+      if (k !== t.choice && p >= 0.05) alternatives.push(original(head[k]));
     }
     if (operation === 'TYPE_TEXT') {
       // Jev chose a KEY (it never saw the value); substitute the real value back in locally.
@@ -530,7 +604,7 @@ export async function decide(
       text = inputs[validate(result.answers.text_value, remainingInputs).choice];
     }
   } else if (operation in controls) {
-    action = controls[operation];
+    action = original(controls[operation]);
   }
   return { operation, action, text, confidence: opAnswer.confidence, latencyMs, inputTokens, alternatives, degraded };
 }

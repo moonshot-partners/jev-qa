@@ -11,11 +11,38 @@ export type ExpectState = {
   url: () => string;
   bodyText: () => Promise<string>;
   responses: ResponseRecord[];
+  // Only responses recorded at this step or later count (a phase's own window): a later phase's
+  // `response` assertion must not be satisfied by an earlier phase's traffic.
+  fromStep?: number;
   isElementVisible: (role: string, name: string) => Promise<boolean>;
   runCheck: (name: string, args?: unknown) => Promise<{ ok: boolean; detail: string }>;
 };
 
-export type ExpectResult = { assertion: ExpectAssertion; ok: boolean; expected: string; actual: string };
+export type ExpectResult = { assertion: ExpectAssertion; ok: boolean; expected: string; actual: string; phase?: string };
+
+// PURE (no side effects): the assertions that only READ page/network state — safe to evaluate
+// repeatedly. A `check` runs app code and may act (create a mailbox), so it is never polled.
+export function isPureAssertion(a: ExpectAssertion): boolean {
+  return 'url' in a || 'text' in a || 'absentText' in a || 'element' in a || 'response' in a;
+}
+
+// Waits until every pure assertion in the list holds, or the deadline passes — the page's last
+// action (a submit that shows "Processing…") may still be in flight when Jev answers DONE, and
+// its result is exactly what the expectations describe. Returns how long it waited.
+export async function settleExpectations(expect: ExpectAssertion[], state: ExpectState, timeoutMs: number, intervalMs = 500): Promise<number> {
+  // Only the pure assertions BEFORE the first check: a later one may describe the state a check
+  // produces (a check that opens a link, then a `url`), which cannot come true until it ran.
+  const firstCheck = expect.findIndex((a) => !isPureAssertion(a));
+  const pure = (firstCheck < 0 ? expect : expect.slice(0, firstCheck)).filter(isPureAssertion);
+  if (!pure.length) return 0;
+  const started = Date.now();
+  for (;;) {
+    const results = await Promise.all(pure.map((a) => evalOne(a, state)));
+    if (results.every((r) => r.ok)) return Date.now() - started;
+    if (Date.now() - started >= timeoutMs) return Date.now() - started;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
 
 function parseMaybeRegex(s: string): RegExp | null {
   const m = /^\/(.*)\/([a-z]*)$/.exec(s);
@@ -70,7 +97,7 @@ async function evalOne(a: ExpectAssertion, state: ExpectState): Promise<ExpectRe
   if ('response' in a) {
     const { method, url, status, bodyIncludes, jsonPath, equals } = a.response;
     const re = new RegExp(url);
-    const byShape = state.responses.filter((r) => (!method || r.method.toUpperCase() === method.toUpperCase()) && re.test(r.url) && r.status === status);
+    const byShape = state.responses.filter((r) => r.step >= (state.fromStep ?? 0)).filter((r) => (!method || r.method.toUpperCase() === method.toUpperCase()) && re.test(r.url) && r.status === status);
     let match: ResponseRecord | undefined;
     let failDetail = '';
     for (const r of byShape) {
@@ -108,8 +135,30 @@ async function evalOne(a: ExpectAssertion, state: ExpectState): Promise<ExpectRe
   return { assertion: a, ok: result.ok, expected: `check "${name}" ok`, actual: result.detail };
 }
 
-export async function evaluate(assertions: ExpectAssertion[], state: ExpectState): Promise<ExpectResult[]> {
+// Round 9 (P2): a pure assertion AFTER a check may describe what the check started (an
+// asynchronous page update), so with a settle window it is polled until it holds or the window
+// passes. Pure assertions before the first check were already settled (settleExpectations), and
+// a check itself is never re-run — it may act.
+export async function evaluate(
+  assertions: ExpectAssertion[],
+  state: ExpectState,
+  opts: { settleMs?: number; intervalMs?: number } = {},
+): Promise<ExpectResult[]> {
+  const settleMs = opts.settleMs ?? 0;
+  const intervalMs = opts.intervalMs ?? 250;
   const results: ExpectResult[] = [];
-  for (const a of assertions) results.push(await evalOne(a, state));
+  let afterCheck = false;
+  for (const a of assertions) {
+    let r = await evalOne(a, state);
+    if (!isPureAssertion(a)) afterCheck = true;
+    else if (afterCheck && !r.ok && settleMs > 0) {
+      const started = Date.now();
+      while (!r.ok && Date.now() - started < settleMs) {
+        await new Promise((res) => setTimeout(res, intervalMs));
+        r = await evalOne(a, state);
+      }
+    }
+    results.push(r);
+  }
   return results;
 }

@@ -154,3 +154,15 @@ test('refusedByEnvironment: non-mutating scenario is never refused', () => {
   assert.equal(refusedByEnvironment({ mutates: false }, { mutations: false }), false);
   assert.equal(refusedByEnvironment({}, { mutations: false }), false);
 });
+
+
+// Round 9 (P1): the adversarial rule reads per-key certification when the runner supplies it.
+test('adversarial: a key absent from `certified` is BLOCKED even if its value was submitted elsewhere', () => {
+  const v = decideVerdict({
+    kind: 'adversarial', jevDone: true, loopReason: 'done',
+    inputs: { first: 'same-value', second: 'same-value' },
+    submitted: new Set(['same-value']), certified: new Set(['first']), findings: [],
+  });
+  assert.equal(v.verdict, 'BLOCKED');
+  assert.match(v.reason, /second/);
+});

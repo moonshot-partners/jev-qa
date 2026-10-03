@@ -31,7 +31,9 @@ export type Known = { id: string; match: RegExp; kind?: RegExp };
 export type CheckFn = (
   ctx: { env: Environment; role: string | null; page: Page; request: APIRequestContext },
   args: unknown,
-) => Promise<{ ok: boolean; detail: string }>;
+) => Promise<{ ok: boolean; detail: string; url?: string }>;
+// `url` (optional) lets a check also serve as a phase START (see Scenario.then): a check that
+// e.g. reads a mailbox and returns the link it found. Ignored by `expect` assertions.
 
 export type Config = {
   environments: Record<string, Environment>;

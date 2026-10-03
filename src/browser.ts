@@ -1,16 +1,147 @@
 // Playwright is the harness only: one page.evaluate() snapshot per step, and
 // input by coordinates (no locator auto-wait).
+//
+// Frames: the snapshot script runs in the main document AND in every child frame
+// (frame.evaluate works for a cross-origin <iframe> too — the engine never needs DOM
+// access across the boundary). Each frame-hosted action carries `frame` (an index into
+// the frame table built by the last observe() for that page) and geometry translated to
+// page coordinates, so input stays "click at x,y, then type" exactly as for the main
+// document. Hit-testing is two-sided: the point must land on the frame's own <iframe>
+// element in the main document (nothing laid over it) AND on the target inside the frame.
 import { readFileSync } from 'node:fs';
-import type { Page } from 'playwright';
+import type { Frame, Page } from 'playwright';
 import type { Action, Observation } from './jev.ts';
 
 const SNAPSHOT = readFileSync(new URL('./snapshot.js', import.meta.url), 'utf8');
+
+type Box = { x: number; y: number; w: number; h: number };
+
+// Per page: every frame any observe() has seen, in first-seen order (0 = main). Indices are
+// STABLE for the page's lifetime — a frame keeps its index across observations and a new frame
+// is appended, never inserted — so an action or `lastFill` decided against one observation
+// still names the same frame after the page re-rendered and the next observation ran.
+const frameTables = new WeakMap<Page, Frame[]>();
+
+function frameOf(page: Page, index: number | undefined): Frame {
+  if (!index) return page.mainFrame();
+  const frame = frameTables.get(page)?.[index];
+  if (!frame || frame.isDetached()) throw new Error('target frame detached');
+  return frame;
+}
+
+// The frame's CONTENT box (where its viewport starts) in MAIN-FRAME coordinates: Playwright's
+// boundingBox() is the <iframe> element's border box relative to the main frame (nested frames
+// included), so the element's own border and padding are added — a framed control's
+// frame-local coordinates count from inside them. Null when the frame element cannot be
+// resolved or has no box (detached, display:none). With `scroll`, first brings the <iframe>
+// into the main viewport — scrollIntoView inside a frame never scrolls its parent.
+async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
+  if (frame === frame.page().mainFrame()) return { x: 0, y: 0, w: Infinity, h: Infinity };
+  const el = await frame.frameElement().catch(() => null);
+  if (!el) return null;
+  try {
+    if (scroll) await el.scrollIntoViewIfNeeded({ timeout: 2_000 }).catch(() => {});
+    const box = await el.boundingBox();
+    if (!box) return null;
+    const inset = await el
+      .evaluate((e) => {
+        const cs = getComputedStyle(e as Element);
+        const px = (v: string) => parseFloat(v) || 0;
+        const h = e as HTMLElement;
+        // Round 10 (P2): any transform other than a pure translation, on the iframe or any
+        // ancestor in its document (a mirror keeps the box size, so the size test alone misses it).
+        let warped = false;
+        for (let x: Element | null = e as Element; x; x = x.parentElement) {
+          const s = getComputedStyle(x);
+          const t = s.transform;
+          const m = /^matrix\(([^)]*)\)$/.exec(t);
+          const m3 = /^matrix3d\(([^)]*)\)$/.exec(t);
+          const pure2 = m && (() => { const [a, b, c, d] = m[1].split(',').map(Number); return a === 1 && b === 0 && c === 0 && d === 1; })();
+          const pure3 = m3 && (() => { const v = m3[1].split(',').map(Number); return [0, 5, 10, 15].every((i) => v[i] === 1) && [1, 2, 3, 4, 6, 7, 8, 9, 11].every((i) => v[i] === 0); })();
+          if ((t && t !== 'none' && !pure2 && !pure3) || (s.scale && s.scale !== 'none') || (s.rotate && s.rotate !== 'none') || ((s as any).zoom && !['1', 'normal', ''].includes(String((s as any).zoom)))) warped = true;
+        }
+        return { warped, l: px(cs.borderLeftWidth) + px(cs.paddingLeft), t: px(cs.borderTopWidth) + px(cs.paddingTop), r: px(cs.borderRightWidth) + px(cs.paddingRight), b: px(cs.borderBottomWidth) + px(cs.paddingBottom), ow: h.offsetWidth, oh: h.offsetHeight };
+      })
+      .catch(() => null);
+    // Round 9 (P2): frame-local coordinates are added to the frame's on-page box unscaled, so a
+    // CSS-transformed frame (its own, or an ancestor's: scale, rotate) would put the click on a
+    // different control while every hit test still passes. Its on-page size then differs from
+    // its untransformed layout size — refuse such a frame instead of guessing.
+    if (!inset || inset.warped || Math.abs(box.width - inset.ow) > 1 || Math.abs(box.height - inset.oh) > 1) return null;
+    // A nested frame inherits every ancestor frame's geometry: refuse it when any ancestor is refused.
+    const parent = frame.parentFrame();
+    if (parent && parent !== frame.page().mainFrame() && !(await frameBox(parent))) return null;
+    return { x: box.x + inset.l, y: box.y + inset.t, w: Math.max(0, box.width - inset.l - inset.r), h: Math.max(0, box.height - inset.t - inset.b) };
+  } finally {
+    await el.dispose().catch(() => {});
+  }
+}
+
+// Round 10/11 (P1): joins parts up to `max` characters WITHOUT cutting or splitting one — a cut
+// part (or one split into lines) could leave a secret fragment no redaction recognises.
+export function fitWholeParts(parts: string[], max: number): string {
+  const out: string[] = [];
+  let length = 0;
+  for (const part of parts) {
+    const add = part.length + (out.length ? 1 : 0);
+    if (length + add > max) continue;
+    out.push(part);
+    length += add;
+  }
+  return out.join('\n');
+}
+
+// Merges every child frame's snapshot into the main observation: actions get `frame` + page
+// coordinates (dropped when their centre falls outside the iframe's box or the viewport — the
+// browser would not deliver a click there), frame text is appended to the page text.
+async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promise<void> {
+  const main = page.mainFrame();
+  const controls = obs.actions.filter((a) => a.node === undefined);
+  const elements = obs.actions.filter((a) => a.node !== undefined);
+  const texts: string[] = [];
+  const crashes: string[] = [];
+  const vw = obs.w ?? Infinity;
+  const vh = obs.h ?? Infinity;
+  for (const frame of page.frames()) {
+    if (frame === main || frame.isDetached()) continue;
+    const box = await frameBox(frame);
+    if (!box || box.w <= 0 || box.h <= 0) continue;
+    let sub: Observation | null;
+    try {
+      sub = (await frame.evaluate(SNAPSHOT)) as Observation | null;
+    } catch {
+      continue; // about:blank, mid-navigation, or a frame that refuses evaluation: not actionable
+    }
+    if (!sub) continue;
+    let index = frames.indexOf(frame);
+    if (index < 0) index = frames.push(frame) - 1;
+    for (const a of sub.actions) {
+      if (a.node === undefined || !a.rect) continue;
+      const rect = { x: a.rect.x + box.x, y: a.rect.y + box.y, w: a.rect.w, h: a.rect.h };
+      const cx = rect.x + rect.w / 2;
+      const cy = rect.y + rect.h / 2;
+      if (cx < box.x || cy < box.y || cx > box.x + box.w || cy > box.y + box.h) continue;
+      if (cx < 0 || cy < 0 || cx >= vw || cy >= vh) continue;
+      elements.push({ ...a, frame: index, rect });
+    }
+    if (sub.text) texts.push(sub.text);
+    // Round 12 (P1): a crash shown only inside a frame must reach the crash check too.
+    if (sub.crash_text) crashes.push(sub.crash_text);
+  }
+  elements.forEach((a, i) => (a.id = 'e' + (i + 1)));
+  obs.actions = [...elements, ...controls];
+  if (texts.length) obs.text = fitWholeParts([obs.text, ...texts].filter(Boolean), 6000);
+  if (crashes.length) obs.crash_text = [obs.crash_text ?? '', ...crashes].filter(Boolean).join('\n').slice(0, 200_000);
+}
 
 export async function observe(page: Page): Promise<Observation> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const obs = (await page.evaluate(SNAPSHOT)) as Observation | null;
       if (obs) {
+        const frames: Frame[] = frameTables.get(page) ?? [page.mainFrame()];
+        await mergeFrames(page, obs, frames);
+        frameTables.set(page, frames);
         obs.actions.push({ id: 'press_enter', kind: 'key', label: 'Press Enter in the focused field (submit a typed search or form)' });
         return obs;
       }
@@ -23,8 +154,13 @@ export async function observe(page: Page): Promise<Observation> {
 }
 
 // Re-read geometry right before input and refuse if another element covers the target.
-async function point(page: Page, node: number): Promise<{ x: number; y: number }> {
-  const p = await page.evaluate((id) => {
+// For a frame-hosted target the check is two-sided: inside the frame (frame-local
+// coordinates) the point must hit the target; in the main document (page coordinates) it must
+// hit an <iframe> — a modal, a sticky bar or a popover laid over the frame would otherwise
+// swallow the click. Every intermediate frame of a deeper nesting is checked the same way.
+async function point(page: Page, node: number, frameIndex?: number): Promise<{ x: number; y: number }> {
+  const frame = frameOf(page, frameIndex);
+  const p = await frame.evaluate((id) => {
     const e = (window as any).__jevFast?.nodes.get(id) as Element | undefined;
     if (!e?.isConnected) return { error: 'target detached' };
     e.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -36,7 +172,31 @@ async function point(page: Page, node: number): Promise<{ x: number; y: number }
     return { x, y };
   }, node);
   if ('error' in p) throw new Error(p.error as string);
-  return p;
+  if (!frameIndex) return p;
+  const box = await frameBox(frame, true);
+  if (!box) throw new Error('target frame not visible');
+  const x = p.x + box.x;
+  const y = p.y + box.y;
+  if (p.x < 0 || p.y < 0 || p.x > box.w || p.y > box.h) throw new Error('target outside its frame');
+  // At EVERY level up to the main document (round 9, P2: not just the direct parent), the
+  // element under the page point must be that level's own <iframe>: an overlay in any ancestor
+  // document, or a sibling frame laid over it, would receive the click instead. The point is
+  // translated into each parent's own viewport.
+  for (let cur: Frame = frame; cur.parentFrame(); ) {
+    const parent = cur.parentFrame()!;
+    const parentBox = await frameBox(parent);
+    const el = await cur.frameElement().catch(() => null);
+    if (!parentBox || !el) throw new Error('target frame not visible');
+    let own: boolean;
+    try {
+      own = await el.evaluate((e, [px, py]) => document.elementFromPoint(px, py) === e, [x - parentBox.x, y - parentBox.y] as [number, number]);
+    } finally {
+      await el.dispose().catch(() => {});
+    }
+    if (!own) throw new Error('target occluded (frame covered)');
+    cur = parent;
+  }
+  return { x, y };
 }
 
 // Round 8 (N6); extended round 9 (O7): re-resolves the intended field and confirms the page's OWN
@@ -50,12 +210,13 @@ async function point(page: Page, node: number): Promise<{ x: number; y: number }
 // evaluate() are wrapped in the SAME try/catch (round 9, O7 #10) — a detached node or a
 // mid-navigation context-destroy on EITHER call must fail closed, not throw past the caller.
 // False on ANY failure (detached, occluded, focus didn't land, value doesn't match) — the caller
-// must skip the Enter entirely.
-export async function focusAndVerify(page: Page, node: number, expectedValue: string): Promise<boolean> {
+// must skip the Enter entirely. The focus check runs in the target's own frame: a frame has its
+// own document.activeElement.
+export async function focusAndVerify(page: Page, node: number, expectedValue: string, frameIndex?: number): Promise<boolean> {
   try {
-    const { x, y } = await point(page, node);
+    const { x, y } = await point(page, node, frameIndex);
     await page.mouse.click(x, y);
-    return await page.evaluate(
+    return await frameOf(page, frameIndex).evaluate(
       ({ id, expected }) => {
         const e = (window as any).__jevFast?.nodes.get(id) as Element | undefined;
         if (!e || document.activeElement !== e) return false;
@@ -69,8 +230,8 @@ export async function focusAndVerify(page: Page, node: number, expectedValue: st
   }
 }
 
-async function expanded(page: Page, node: number): Promise<string | null> {
-  return page.evaluate((id) => {
+async function expanded(page: Page, node: number, frameIndex?: number): Promise<string | null> {
+  return frameOf(page, frameIndex).evaluate((id) => {
     const e = (window as any).__jevFast?.nodes.get(id) as Element | undefined;
     return e?.getAttribute('aria-expanded') ?? null;
   }, node);
@@ -84,20 +245,20 @@ async function settle(page: Page) {
 export async function act(page: Page, action: Action, text: string | null) {
   switch (action.kind) {
     case 'click': {
-      const { x, y } = await point(page, action.node!);
+      const { x, y } = await point(page, action.node!, action.frame);
       // Hover-opened menus (e.g. a top nav) toggle closed on the first click after the
       // hover: move first, and if hovering alone expanded the target, leave it open.
-      const expandedBefore = await expanded(page, action.node!);
+      const expandedBefore = await expanded(page, action.node!, action.frame);
       await page.mouse.move(x, y);
       if (expandedBefore === 'false') {
         await page.waitForTimeout(150);
-        if ((await expanded(page, action.node!)) === 'true') break;
+        if ((await expanded(page, action.node!, action.frame)) === 'true') break;
       }
       await page.mouse.click(x, y);
       break;
     }
     case 'fill': {
-      const { x, y } = await point(page, action.node!);
+      const { x, y } = await point(page, action.node!, action.frame);
       await page.mouse.click(x, y);
       await page.keyboard.press('ControlOrMeta+a');
       await page.keyboard.insertText(text ?? '');
@@ -108,7 +269,7 @@ export async function act(page: Page, action: Action, text: string | null) {
       break;
     }
     case 'select':
-      await page.evaluate(
+      await frameOf(page, action.frame).evaluate(
         ({ id, value }) => {
           const e = (window as any).__jevFast.nodes.get(id) as HTMLSelectElement;
           e.value = value;

@@ -50,11 +50,17 @@ export function classify(kind: string, detail: string, opts: { noise?: RegExp[];
 // Shared by watch()'s internal oracles and the runner's own crash-screen
 // check, so every finding — whatever detects it — goes through the same
 // noise/known classification and de-duplication.
-export function record(sink: Sink, url: string, step: number, kind: string, detail: string, opts: { noise?: RegExp[]; known?: Known[] }): void {
+export function record(sink: Sink, url: string, step: number, kind: string, detail: string, opts: { noise?: RegExp[]; known?: Known[]; mask?: (s: string) => string }): void {
   const result = classify(kind, detail, opts);
   if (!result) return;
   if (sink.findings.some((f) => f.kind === result.kind && f.detail === detail)) return;
-  sink.findings.push({ kind: result.kind, detail: detail.slice(0, 400), url, step });
+  // Round 9 (P1): kept whole (bounded only against runaway messages). The runner masks secret
+  // inputs and THEN clips to 400 (persistFinding) — clipping first could cut a secret at the
+  // boundary into a prefix the mask no longer recognises.
+  // Round 10 (P1): masked at capture time when the caller knows the secrets, so even the 20k
+  // bound can never cut a secret into an unmaskable prefix.
+  const kept = opts.mask ? opts.mask(detail) : detail;
+  sink.findings.push({ kind: result.kind, detail: kept.slice(0, 20_000), url: opts.mask ? opts.mask(url) : url, step });
 }
 
 // Watches a page for the run's duration and returns a `detach()` that
@@ -62,13 +68,16 @@ export function record(sink: Sink, url: string, step: number, kind: string, deta
 // evaluation are both done, before treating `sink` as final, so a late
 // event can't mutate an already-judged run (see runner.ts's post-loop
 // quiescence sequence).
-export function watch(page: Page, sink: Sink, step: () => number, opts: { ownOrigins: RegExp[]; noise?: RegExp[]; known?: Known[] }): () => void {
+export function watch(page: Page, sink: Sink, step: () => number, opts: { ownOrigins: RegExp[]; noise?: RegExp[]; known?: Known[]; mask?: (s: string) => string }): () => void {
   const add = (kind: string, detail: string) => record(sink, page.url(), step(), kind, detail, opts);
   const isOwnOrigin = (url: string) => opts.ownOrigins.some((re) => re.test(new URL(url).host));
   // Own-origin 401/403 are correct authz answers; the app then logs
   // "[ERROR] Failed to fetch X" to the console. Tag such console errors as
   // known:authz when a 401/403 landed in the same step.
   const denied = new Set<number>();
+  // Round 10 (P1): the step each request was SENT in — a response belongs to that step, not to the
+  // step it happens to arrive in (a slow request from one phase must not count in the next).
+  const sentAt = new WeakMap<object, number>();
 
   const onPageError = (e: Error) => add('pageerror', e.message);
   // "Failed to load resource: … status of NNN" carries no URL, so it cannot
@@ -79,6 +88,7 @@ export function watch(page: Page, sink: Sink, step: () => number, opts: { ownOri
     add(denied.has(step()) && /fetch|permission|forbidden|unauthori/i.test(m.text()) ? 'known:authz console.error' : 'console.error', m.text());
   };
   const onRequest = (req: PlaywrightRequest) => {
+    sentAt.set(req, step());
     if (!isOwnOrigin(req.url())) return;
     const raw = req.postData();
     const bodyOversized = raw !== null && Buffer.byteLength(raw, 'utf8') > 64 * 1024;
@@ -92,11 +102,11 @@ export function watch(page: Page, sink: Sink, step: () => number, opts: { ownOri
     const s = r.status();
     const own = isOwnOrigin(r.url());
     // 401/403 can be correct authz behaviour; any other own-origin 4xx is a broken link or route.
-    if (own && (s === 401 || s === 403)) denied.add(step());
+    if (own && (s === 401 || s === 403)) denied.add(sentAt.get(r.request()) ?? step());
     if (s >= 500 || (own && s >= 400 && s !== 401 && s !== 403)) add(`http ${s}`, `${r.request().method()} ${r.url()}`);
     if (own) {
       const contentType = r.headers()['content-type'] ?? '';
-      const responseRecord: ResponseRecord = { step: step(), method: r.request().method(), url: r.url(), status: s, contentType };
+      const responseRecord: ResponseRecord = { step: sentAt.get(r.request()) ?? step(), method: r.request().method(), url: r.url(), status: s, contentType };
       sink.responses.push(responseRecord);
       if (contentType.includes('application/json')) {
         sink.pending.push(
