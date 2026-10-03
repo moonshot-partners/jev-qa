@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { RequestRecord, ResponseRecord } from '../src/oracles.ts';
-import { capRecent, certifiedInputKeys, flattenInputEntries, maskSecrets, persistFinding, persistedTimeline } from '../src/runner.ts';
+import { fitWholeParts } from '../src/browser.ts';
+import { capRecent, certifiedInputKeys, clipLabel, flattenInputEntries, maskSecrets, persistFinding, persistedTimeline } from '../src/runner.ts';
 
 // --- round 10 (Q3): capRecent — results.json persistence cap -----------------------------------
 
@@ -110,4 +111,23 @@ test('certifiedInputKeys: a main-phase key inherited by a later phase is certifi
     { inputs: { email: 'a@x.test' }, values: new Set(['a@x.test']) },
   ];
   assert.ok(certifiedInputKeys(entries, windows).has('email'));
+});
+
+
+// Round 11 (P1): a stuck reason quotes an action label — masked first, then clipped.
+test('clipLabel masks before clipping', () => {
+  const secret = 'Sx8!kLmN2pQr4t'; // 14 characters
+  const label = 'Open the field named ' + 'z'.repeat(10) + secret;
+  const out = clipLabel(label, (t: string) => t.split(secret).join('«pw»'), 40);
+  assert.ok(out.length <= 40);
+  assert.ok(!out.includes('Sx8!'), out);
+});
+
+// Round 11 (P1): frame text is joined as WHOLE parts — never split into lines, so a short first
+// line of a multi-line secret can never be kept on its own.
+test("fitWholeParts never keeps part of a multi-line part", () => {
+  const secret = "Wv3!pQ9#zT\n" + "q".repeat(4000);
+  const out = fitWholeParts(["m".repeat(2500), secret], 6000);
+  assert.ok(!out.includes("Wv3!pQ9#zT"), "the first line alone is not kept");
+  assert.equal(out, "m".repeat(2500));
 });

@@ -30,6 +30,9 @@ ${overlay ? '<div id="overlay" style="position:fixed;left:0;top:0;width:100%;hei
 // 998 characters (6 copies + separators end 6 short of the cap), distinctive in every 6-character window (no repeats of the head).
 const ECHO_SECRET = 'Kq7Zw!' + Array.from({ length: 992 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('');
 
+// A multi-line secret: a short distinctive first line, then a long second line.
+const ML_SECRET = 'Wv3!pQ9#zT' + '\n' + Array.from({ length: 4000 }, (_, i) => String.fromCharCode(97 + ((i * 7) % 26))).join('');
+
 const INNER_HTML = `<!doctype html>
 <html><head><title>inner</title></head><body>
 <label for="card">Card number</label>
@@ -47,6 +50,9 @@ async function fixture(): Promise<{ server: Server; base: string }> {
     if (path === '/inner') res.end(INNER_HTML);
     else if (path === '/covered') res.end(OUTER_HTML(true));
     else if (path === '/echo') res.end('<!doctype html><html><body>' + Array.from({ length: 7 }, () => '<p>' + ECHO_SECRET + '</p>').join('') + '</body></html>');
+    else if (path === '/bigcrash') res.end('<!doctype html><html><body><p>' + 'x'.repeat(3500) + ' Application error: a client-side exception has occurred ' + 'y'.repeat(3500) + '</p></body></html>');
+    else if (path === '/mlframe') res.end('<!doctype html><html><body><p>' + 'm'.repeat(2500) + '</p><iframe src="/mlsecret" style="width:600px;height:300px;border:0"></iframe></body></html>');
+    else if (path === '/mlsecret') res.end('<!doctype html><html><body><pre>' + ML_SECRET + '</pre></body></html>');
     else if (path === '/mid') res.end('<!doctype html><html><body><iframe id="m" src="/inner" style="width:380px;height:180px;border:0"></iframe></body></html>');
     else if (path === '/nested-covered') res.end('<!doctype html><html><body><iframe id="o" src="/mid" style="width:420px;height:220px;border:0"></iframe><div id="overlay" style="position:fixed;left:0;top:0;width:100%;height:100%;z-index:10;background:rgba(0,0,0,0.01)"></div></body></html>');
     else if (path === '/scaled') res.end('<!doctype html><html><body><iframe id="s" src="/inner" style="width:400px;height:200px;border:0;transform:scale(0.5);transform-origin:0 0"></iframe></body></html>');
@@ -283,6 +289,47 @@ test('frames: a mirrored frame (scaleX(-1)) is not offered; a translated one sti
     await page.waitForTimeout(500);
     obs = await observe(page);
     assert.equal(obs.actions.filter((a) => a.label === 'Card number' && a.kind === 'fill').length, 1, 'translated: still offered');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+
+// Round 11 (P1): a single visible text node over the cap is not offered to Jev whole, but the
+// crash check must still see it (obs.crash_text, never sent to the decision API).
+test('snapshot: a huge single text node still reaches the crash check', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 4000 } });
+    await page.goto(base + '/bigcrash');
+    const obs = await observe(page);
+    assert.match((obs as any).crash_text ?? '', /application error/i);
+    const { body } = buildBody(obs, 'goal', {}, []);
+    assert.ok(!JSON.stringify(body).includes('crash_text'), 'the crash sample is never part of the decision request');
+    await page.close();
+  } finally {
+    await browser?.close();
+    server.close();
+  }
+});
+
+// Round 11 (P1): frame text is added whole or not at all — splitting it into lines could keep a
+// short first line of a multi-line secret that no redaction recognises.
+test('frames: a multi-line secret in a frame is never partly forwarded', { skip: SKIP }, async () => {
+  const { server, base } = await fixture();
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 4000 } });
+    await page.goto(base + '/mlframe');
+    await page.waitForTimeout(500);
+    const obs = await observe(page);
+    const { body } = buildBody(obs, 'goal', { secret: ML_SECRET }, [], new Set(), [ML_SECRET]);
+    assert.ok(!JSON.stringify(body).includes('Wv3!pQ9#zT'), 'the first line of the secret is not forwarded');
     await page.close();
   } finally {
     await browser?.close();

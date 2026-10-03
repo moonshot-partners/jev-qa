@@ -56,6 +56,8 @@ export type Observation = {
   url: string;
   title: string;
   text: string;
+  // Round 11: all visible text (bounded) for the LOCAL crash check only; buildBody() never sends it.
+  crash_text?: string;
   actions: Action[];
   omitted_actions: number;
   w?: number; // viewport size, as the snapshot saw it (used to clip frame-hosted targets)
@@ -187,18 +189,36 @@ function escapeRegExp(s: string): string {
 // truncation boundary — a non-alphanumeric character, an ellipsis (`…` or `...`), or the end of
 // the string — never mid-word, so a real 12-char prefix can't accidentally match as a SUBSTRING
 // of some longer, unrelated word either.
-function prefixPattern(value: string): RegExp | null {
-  if (value.length < 16) return null;
-  const prefixes: string[] = [];
-  for (let len = value.length - 1; len >= 12; len--) prefixes.push(escapeRegExp(value.slice(0, len)));
-  // A single non-alphanumeric character already covers an ellipsis (either "…" or the first "."
-  // of "...") as well as ordinary punctuation/whitespace; `$` covers a prefix that runs to the
-  // very end of the text with nothing after it at all.
-  return new RegExp(`(?:${prefixes.join('|')})(?=[^A-Za-z0-9]|$)`, 'g');
+// Round 11: a linear scan with the SAME semantics as the old one-regex-per-value alternation of
+// every prefix (longest first), which grew to ~n²/2 characters and ran Node out of memory for a
+// long secret (a 4,000-character value built an ~8M-character pattern). For each occurrence of
+// the value's first 12 characters: extend while the text agrees with the value (at most
+// length - 1 — the whole value is handled by redactionForms()), then step back to the longest
+// prefix that ends at a genuine truncation boundary (a non-alphanumeric character, or the end).
+function redactTruncatedPrefixes(text: string, value: string, marker: string): string {
+  if (value.length < 16) return text;
+  const head = value.slice(0, 12);
+  const isBoundary = (i: number) => i >= text.length || /[^A-Za-z0-9]/.test(text[i]);
+  let out = '';
+  let from = 0;
+  for (let i = text.indexOf(head, from); i !== -1; i = text.indexOf(head, from)) {
+    let k = 12;
+    while (k < value.length - 1 && i + k < text.length && text[i + k] === value[k]) k++;
+    let end = -1;
+    for (let len = k; len >= 12; len--) if (isBoundary(i + len)) { end = i + len; break; }
+    if (end === -1) {
+      out += text.slice(from, i + 1);
+      from = i + 1;
+      continue;
+    }
+    out += text.slice(from, i) + marker;
+    from = end;
+  }
+  return out + text.slice(from);
 }
 
 // Redacts every occurrence of ONE value (in every form redactionForms() produces, plus any
-// truncated prefix — see prefixPattern()) to ONE marker. Shared by redact() (per-input, marker
+// truncated prefix — see redactTruncatedPrefixes()) to ONE marker. Shared by redact() (per-input, marker
 // is the input's own «key») and the config-secrets pass (round 8, N2 — marker is always
 // «secret», since a config secret has no scenario-input key to redact it BY).
 export function redactValue(text: string, value: string, marker: string): string {
@@ -215,9 +235,7 @@ export function redactValue(text: string, value: string, marker: string): string
       out = out.split(variant).join(marker);
     }
   }
-  const prefixes = prefixPattern(value);
-  if (prefixes) out = out.replace(prefixes, marker);
-  return out;
+  return redactTruncatedPrefixes(out, value, marker);
 }
 
 // Order doesn't matter: distinct scenario input values don't overlap in practice, and even if

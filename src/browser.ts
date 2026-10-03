@@ -77,15 +77,15 @@ async function frameBox(frame: Frame, scroll = false): Promise<Box | null> {
   }
 }
 
-// Round 10 (P1): joins lines up to `max` characters WITHOUT cutting one — a cut line could
-// leave a secret prefix too short for any redaction to recognise.
-function fitWholeLines(lines: string[], max: number): string {
+// Round 10/11 (P1): joins parts up to `max` characters WITHOUT cutting or splitting one — a cut
+// part (or one split into lines) could leave a secret fragment no redaction recognises.
+export function fitWholeParts(parts: string[], max: number): string {
   const out: string[] = [];
   let length = 0;
-  for (const line of lines) {
-    const add = line.length + (out.length ? 1 : 0);
+  for (const part of parts) {
+    const add = part.length + (out.length ? 1 : 0);
     if (length + add > max) continue;
-    out.push(line);
+    out.push(part);
     length += add;
   }
   return out.join('\n');
@@ -127,7 +127,7 @@ async function mergeFrames(page: Page, obs: Observation, frames: Frame[]): Promi
   }
   elements.forEach((a, i) => (a.id = 'e' + (i + 1)));
   obs.actions = [...elements, ...controls];
-  if (texts.length) obs.text = fitWholeLines([obs.text, ...texts].filter(Boolean).join('\n').split('\n'), 6000);
+  if (texts.length) obs.text = fitWholeParts([obs.text, ...texts].filter(Boolean), 6000);
 }
 
 export async function observe(page: Page): Promise<Observation> {

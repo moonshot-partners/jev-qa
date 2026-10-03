@@ -102,7 +102,7 @@ export function watch(page: Page, sink: Sink, step: () => number, opts: { ownOri
     const s = r.status();
     const own = isOwnOrigin(r.url());
     // 401/403 can be correct authz behaviour; any other own-origin 4xx is a broken link or route.
-    if (own && (s === 401 || s === 403)) denied.add(step());
+    if (own && (s === 401 || s === 403)) denied.add(sentAt.get(r.request()) ?? step());
     if (s >= 500 || (own && s >= 400 && s !== 401 && s !== 403)) add(`http ${s}`, `${r.request().method()} ${r.url()}`);
     if (own) {
       const contentType = r.headers()['content-type'] ?? '';

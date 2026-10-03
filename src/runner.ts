@@ -83,6 +83,12 @@ export function maskSecrets(text: string, s: Pick<Scenario, 'inputs' | 'then' | 
   return out;
 }
 
+// PURE (round 11): an action label quoted in a stuck reason — masked FIRST, then clipped, so a
+// secret echoed in a label can never be cut into an unmaskable fragment.
+export function clipLabel(label: string, mask: (s: string) => string, n = 40): string {
+  return mask(label).slice(0, n);
+}
+
 // PURE: a finding as it leaves the run — masked FIRST, then clipped to 400 characters, so a
 // secret that straddles the clip boundary is replaced whole instead of surviving as a prefix.
 export function persistFinding(f: Finding, mask: (s: string) => string): Finding {
@@ -345,7 +351,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       lastExecutedStep = step;
       reportStep = step;
       const obs: Observation = await observe(page);
-      const crash = crashText.find((re) => re.test(obs.text));
+      const crash = crashText.find((re) => re.test(obs.crash_text ?? obs.text));
       if (crash) record(sink, obs.url, step, 'crash-screen', crash.source, { noise: config.noise, known: config.known, mask });
       const certified = certifiedKeys();
       const d: Decision = await decide(obs, phase.goal, phaseInputs, history, certified, phaseSecrets, pseudonyms);
@@ -573,7 +579,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
         // A target that cannot be reached at all (permanently occluded, detached) is its own
         // stuck signal: a transient overlay clears within a few attempts, a permanent one never.
         if (++consecutiveFailures >= 4) {
-          loopReason = `stuck: "${d.action.label.slice(0, 40)}" could not be executed 4 times`;
+          loopReason = `stuck: "${clipLabel(d.action.label, mask)}" could not be executed 4 times`;
           break;
         }
         // A short backoff: a toast, an animation or a closing overlay clears in well under a
@@ -604,7 +610,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       // counter's business above (and a retry after one is not a repeat — see the repeat guard).
       const last = history.filter((h) => !h.failed).slice(-4).map((h) => h.kind + h.action + (h.text ?? ''));
       if (last.length === 4 && new Set(last).size === 1) {
-        loopReason = `stuck: repeated "${d.action.label.slice(0, 40)}" 4 times`;
+        loopReason = `stuck: repeated "${clipLabel(d.action.label, mask)}" 4 times`;
         break;
       }
       if (unchanged >= 4) {
@@ -672,7 +678,7 @@ async function runOne(browser: Browser, config: Config, envName: string, scenari
       const finalObs = await observe(page!).catch(() => null);
       if (finalObs) {
         finalText = mask(finalObs.text).slice(0, 1_500); // mask BEFORE clipping: a clip can cut a secret in two
-        const finalCrash = crashText.find((re) => re.test(finalObs.text));
+        const finalCrash = crashText.find((re) => re.test(finalObs.crash_text ?? finalObs.text));
         if (finalCrash) record(sink, finalObs.url, lastExecutedStep, 'crash-screen', finalCrash.source, { noise: config.noise, known: config.known, mask });
       }
     };

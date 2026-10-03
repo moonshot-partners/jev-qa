@@ -262,3 +262,21 @@ test("watch: a late response keeps its request's step", () => {
   emitter.emit("response", { url: () => "https://example.com/api/slow", status: () => 200, headers: () => ({ "content-type": "text/plain" }), request: () => req });
   assert.equal(sink.responses[0].step, 3);
 });
+
+
+// Round 11 (P1): a late 401/403 marks its REQUEST's step as denied, not the current step — an
+// unrelated "Failed to fetch" in a later phase must not be tagged known:authz.
+test('watch: a late 403 does not mark the current step denied', () => {
+  const emitter = new EventEmitter();
+  const page = Object.assign(emitter, { url: () => 'https://example.com/x' }) as unknown as Page;
+  const sink = newSink();
+  let current = 3;
+  watch(page, sink, () => current, { ownOrigins: [/example\.com/] });
+  const req = fakeRequest('https://example.com/api/private', { method: 'GET' });
+  emitter.emit('request', req);
+  current = 9;
+  emitter.emit('response', { url: () => 'https://example.com/api/private', status: () => 403, headers: () => ({ 'content-type': 'text/plain' }), request: () => req });
+  emitter.emit('console', { type: () => 'error', text: () => 'Failed to fetch /api/other' });
+  assert.equal(sink.findings.length, 1);
+  assert.equal(sink.findings[0].kind, 'console.error');
+});

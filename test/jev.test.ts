@@ -552,3 +552,13 @@ test('redactionForms covers the WHATWG form encoding (literal *, %7E, + for spac
   assert.ok(redactionForms('a~b c').includes('a%7Eb+c'));
   assert.equal(redactValue('https://x.test/login?pw=foo*+bar&n=1', 'foo* bar', '«pw»'), 'https://x.test/login?pw=«pw»&n=1');
 });
+
+// Round 11: a long secret's truncated echo is redacted by a linear scan (the old regex grew to
+// ~n²/2 characters and ran Node out of memory).
+test('redactValue: a 5,000-character secret cut at 3,000 characters is redacted, fast', () => {
+  const value = 'Lg7!' + Array.from({ length: 4996 }, (_, i) => String.fromCharCode(97 + ((i * 11) % 26))).join('');
+  const started = Date.now();
+  const out = redactValue('before ' + value.slice(0, 3000) + '… after', value, '«tok»');
+  assert.equal(out, 'before «tok»… after');
+  assert.ok(Date.now() - started < 1000, 'linear, not quadratic');
+});

@@ -86,11 +86,15 @@
   }
   const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
   const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
+  // Round 11: the crash check gets its own sample of ALL visible text (bounded), never sent to
+  // the decision API — the whole-node rule below may leave a huge single node out of `text`.
+  const crash=[]; let crashLength=0;
+  while ((node=walker.nextNode()) && (length<6000 || crashLength<100000)) {
     const value=node.textContent.trim(), parent=node.parentElement;
     if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
     range.selectNodeContents(node); const r=range.getBoundingClientRect();
     if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
+      if (crashLength<100000) { crash.push(value); crashLength+=value.length+1; }
       // Whole nodes only: a node cut at the cap could leave a secret prefix too short to redact.
       if (length+value.length+(words.length?1:0)>6000) continue;
       words.push(value); length+=value.length+(words.length>1?1:0);
@@ -109,6 +113,6 @@
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
-  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
+  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,crash_text:crash.join('\n'),
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()
